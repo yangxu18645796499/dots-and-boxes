@@ -3,7 +3,9 @@
 点格游戏 Web 版第一阶段骨架，包含：
 - 前端：React + TypeScript + Vite + Zustand + Socket.IO Client
 - 后端：Node.js + Express + Socket.IO + TypeScript
-- 联机模式：房间制，两台电脑可实时对战
+- 联机模式：房间制，两台电脑可实时对战  
+
+## 即刻在**tisicstry.top/games/dots_and_boxes**体验！！
 
 ## 目录结构
 - client/ 前端
@@ -59,3 +61,4 @@
 - 抽离 shared 类型到 `shared/`
 - 补规则单元测试（闭环、加分后连走、结束判定）
 - 加入重连恢复与观战模式
+

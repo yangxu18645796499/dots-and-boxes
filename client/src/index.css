@@ -2,7 +2,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: linear-gradient(130deg, #f4f6fb 0%, #eef4ff 45%, #fff4ee 100%);
+  background: var(--page-bg);
   font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 

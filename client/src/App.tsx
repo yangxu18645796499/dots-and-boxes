@@ -65,6 +65,8 @@ type DiceDecisionPayload = {
   message?: string;
 };
 
+type ThemeMode = 'light' | 'dark' | 'system';
+
 type StoreState = {
   room: RoomState | null;
   playerSymbol: PlayerSymbol | null;
@@ -92,6 +94,7 @@ const useGameStore = create<StoreState>((set) => ({
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
 const SESSION_KEY = 'dots_and_boxes_session_v1';
+const THEME_KEY = 'dots_and_boxes_theme_mode';
 const MIN_SIZE = 2;
 const MAX_SIZE = 8;
 const DOT_SIZE = 14;
@@ -140,6 +143,8 @@ function App() {
     text: '',
   });
   const [selectedHistoryRound, setSelectedHistoryRound] = useState<number | null>(null);
+  const [themeMode, setThemeMode] = useState<ThemeMode>('system');
+  const [effectiveTheme, setEffectiveTheme] = useState<'light' | 'dark'>('light');
 
   const room = useGameStore((s) => s.room);
   const playerSymbol = useGameStore((s) => s.playerSymbol);
@@ -148,6 +153,50 @@ function App() {
   const setPlayerSymbol = useGameStore((s) => s.setPlayerSymbol);
   const setSystemMessage = useGameStore((s) => s.setSystemMessage);
   const resetStore = useGameStore((s) => s.reset);
+
+  useEffect(() => {
+    const saved = localStorage.getItem(THEME_KEY);
+    if (saved === 'light' || saved === 'dark' || saved === 'system') {
+      setThemeMode(saved);
+    }
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const applyTheme = () => {
+      const resolved: 'light' | 'dark' =
+        themeMode === 'system' ? (media.matches ? 'dark' : 'light') : themeMode;
+      document.documentElement.setAttribute('data-theme', resolved);
+      setEffectiveTheme(resolved);
+    };
+
+    applyTheme();
+
+    const onChange = () => {
+      if (themeMode === 'system') {
+        applyTheme();
+      }
+    };
+
+    if (media.addEventListener) {
+      media.addEventListener('change', onChange);
+    } else {
+      media.addListener(onChange);
+    }
+
+    return () => {
+      if (media.removeEventListener) {
+        media.removeEventListener('change', onChange);
+      } else {
+        media.removeListener(onChange);
+      }
+    };
+  }, [themeMode]);
+
+  function updateThemeMode(mode: ThemeMode): void {
+    setThemeMode(mode);
+    localStorage.setItem(THEME_KEY, mode);
+  }
 
   useEffect(() => {
     const socket = io(SERVER_URL, {
@@ -668,6 +717,29 @@ function App() {
   return (
     <div className="page">
       <header className="hero">
+        <div className="theme-switch" role="group" aria-label="主题切换">
+          <button
+            type="button"
+            className={`theme-btn ${themeMode === 'light' ? 'theme-btn-active' : ''}`}
+            onClick={() => updateThemeMode('light')}
+          >
+            浅色
+          </button>
+          <button
+            type="button"
+            className={`theme-btn ${themeMode === 'dark' ? 'theme-btn-active' : ''}`}
+            onClick={() => updateThemeMode('dark')}
+          >
+            深色
+          </button>
+          <button
+            type="button"
+            className={`theme-btn ${themeMode === 'system' ? 'theme-btn-active' : ''}`}
+            onClick={() => updateThemeMode('system')}
+          >
+            跟随系统{themeMode === 'system' ? `(${effectiveTheme === 'dark' ? '深' : '浅'})` : ''}
+          </button>
+        </div>
         <h1>Dots and Boxes</h1>
       </header>
 
