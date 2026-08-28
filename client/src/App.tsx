@@ -595,6 +595,7 @@ function App() {
                   aiConfig,
                   buildPrompt(room, me, valid),
                   image,
+                  SERVER_URL,
                 );
                 edge = parseEdgeReply(reply, valid);
               } catch {

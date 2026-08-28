@@ -143,6 +143,12 @@ type ClearChatPayload = {
   roomId: string;
 };
 
+type AiRelayPayload = {
+  url: string;
+  key: string;
+  body: Record<string, unknown>;
+};
+
 type PresencePingPayload = {
   roomId: string;
   playerToken: string;
@@ -157,6 +163,48 @@ const MAX_CHAT_HISTORY = 150;
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// AI 请求中转：浏览器直连部分 LLM 网关会被扩展/CORS 拦截，由游戏服务器哑转发（不存储 Key）
+app.post('/ai/relay', async (req, res) => {
+  const { url, key, body } = (req.body ?? {}) as AiRelayPayload;
+  if (typeof url !== 'string' || typeof key !== 'string' || !key.trim() || typeof body !== 'object' || !body) {
+    res.status(400).json({ error: { message: '缺少 url / key / body' } });
+    return;
+  }
+
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    res.status(400).json({ error: { message: 'url 无效' } });
+    return;
+  }
+
+  // 密钥安全：仅允许 HTTPS（本机调试允许 localhost），且禁止中转至内网地址
+  const host = target.hostname;
+  const localOk = host === 'localhost' || host.endsWith('.localhost') || host === '127.0.0.1' || host === '0.0.0.0';
+  if (target.protocol !== 'https:' && !localOk) {
+    res.status(400).json({ error: { message: '为保护密钥，中转仅支持 HTTPS 地址' } });
+    return;
+  }
+  if (/^(10|127)\.|^0\.0\.0\.0$|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\.|^169\.254\.|^\[::1\]$/.test(host) && !localOk) {
+    res.status(400).json({ error: { message: '禁止中转至内网地址' } });
+    return;
+  }
+
+  try {
+    const upstream = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(65_000),
+    });
+    const text = await upstream.text();
+    res.status(upstream.status).type('application/json').send(text);
+  } catch {
+    res.status(502).json({ error: { message: '上游 API 请求失败' } });
+  }
+});
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true });

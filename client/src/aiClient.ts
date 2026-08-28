@@ -168,6 +168,7 @@ export async function requestAiMove(
   config: AiConfig,
   prompt: string,
   imageDataUrl: string | null,
+  serverUrl: string,
 ): Promise<string> {
   const controller = new AbortController();
   // 思考型模型推理较慢，超时放宽到 60s
@@ -181,28 +182,37 @@ export async function requestAiMove(
     }
 
     // Qwen 系思考模型默认深度思考，延迟可达数十秒；落子场景关闭思考
-    const body: Record<string, unknown> = {
+    const upstreamBody: Record<string, unknown> = {
       model: config.model,
       // 纯文本时发字符串 content，最大化对 DeepSeek/小模型等严格兼容端点的适配
       messages: [{ role: 'user', content: imageDataUrl ? content : prompt }],
       temperature: 0.2,
     };
     if (/qwen/i.test(config.model)) {
-      body.chat_template_kwargs = { enable_thinking: false };
+      upstreamBody.chat_template_kwargs = { enable_thinking: false };
     }
 
-    const res = await fetch(`${config.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+    // 经游戏服务器中转：绕开浏览器扩展/网络环境对跨域 LLM 请求的拦截（服务器哑转发，不存储 Key）
+    const res = await fetch(`${serverUrl.replace(/\/+$/, '')}/ai/relay`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${config.apiKey}`,
-      },
-      body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: `${config.baseUrl.replace(/\/+$/, '')}/chat/completions`,
+        key: config.apiKey,
+        body: upstreamBody,
+      }),
       signal: controller.signal,
     });
 
     if (!res.ok) {
-      throw new Error(`API 返回 ${res.status}`);
+      let reason = `HTTP ${res.status}`;
+      try {
+        const err = (await res.json()) as { error?: { message?: string } };
+        reason = err.error?.message ?? reason;
+      } catch {
+        // 保留默认原因
+      }
+      throw new Error(reason);
     }
 
     const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
