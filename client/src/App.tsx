@@ -1396,6 +1396,7 @@ function App() {
                   {aiActive && (
                     <p className="hint ai-status">
                       🤖 AI {aiThinking ? '思考中…' : '待机'}
+                      {aiErrors > 0 ? ` · 出错 ${aiErrors} 次` : ''}
                     </p>
                   )}
                 </>
