@@ -542,7 +542,6 @@ function App() {
       void (async () => {
         try {
           const me = playerSymbol;
-          const other: PlayerSymbol = me === 'A' ? 'B' : 'A';
 
           if (room.status === 'waiting') {
             if (!room.specAgreed) {
