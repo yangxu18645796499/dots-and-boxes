@@ -187,7 +187,8 @@ export async function requestAiMove(
       },
       body: JSON.stringify({
         model: config.model,
-        messages: [{ role: 'user', content }],
+        // 纯文本时发字符串 content，最大化对 DeepSeek/小模型等严格兼容端点的适配
+        messages: [{ role: 'user', content: imageDataUrl ? content : prompt }],
         temperature: 0.2,
       }),
       signal: controller.signal,
