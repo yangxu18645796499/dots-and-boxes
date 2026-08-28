@@ -1,9 +1,10 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import { create } from 'zustand';
+import { GAME_RULES } from './gameRules';
 import './App.css';
 
-type PlayerSymbol = 'A' | 'B';
+export type PlayerSymbol = 'A' | 'B';
 
 type Player = {
   id: string;
@@ -12,7 +13,14 @@ type Player = {
   connected?: boolean;
 };
 
-type RoomState = {
+type BoardProposalState = {
+  id: number;
+  rows: number;
+  cols: number;
+  by: PlayerSymbol;
+};
+
+export type RoomState = {
   roomId: string;
   boardRows: number;
   boardCols: number;
@@ -28,6 +36,11 @@ type RoomState = {
   seriesScore: Record<PlayerSymbol, number>;
   roundHistory: RoundHistoryItem[];
   chatHistory?: ChatMessage[];
+  nextRoundVotes?: Record<PlayerSymbol, boolean>;
+  boardProposal?: BoardProposalState | null;
+  spectators?: { id: string; name: string }[];
+  specAgreed?: boolean;
+  specAgreedOnce?: boolean;
   status: 'waiting' | 'rolling' | 'playing' | 'finished';
   winner: PlayerSymbol | 'draw' | null;
 };
@@ -41,6 +54,7 @@ type RoundHistoryItem = {
   scores: Record<PlayerSymbol, number>;
   finalClaimedEdges: Record<string, PlayerSymbol>;
   finalClaimedBoxes: Record<string, PlayerSymbol>;
+  moveOrder?: string[];
   finishedAt: number;
 };
 
@@ -57,6 +71,13 @@ type ChatMessage = {
   senderName: string;
   message: string;
   timestamp: number;
+  kind?: 'text' | 'board-proposal';
+  proposal?: {
+    id: number;
+    rows: number;
+    cols: number;
+    status: 'pending' | 'accepted' | 'rejected';
+  };
 };
 
 type DiceDecisionPayload = {
@@ -65,41 +86,119 @@ type DiceDecisionPayload = {
   message?: string;
 };
 
-type ThemeMode = 'light' | 'dark' | 'system';
+type SystemMessage = { id: number; text: string };
 
 type StoreState = {
   room: RoomState | null;
   playerSymbol: PlayerSymbol | null;
-  systemMessage: string;
+  systemMessages: SystemMessage[];
   setRoom: (room: RoomState) => void;
   setPlayerSymbol: (symbol: PlayerSymbol | null) => void;
-  setSystemMessage: (message: string) => void;
+  pushSystemMessage: (text: string) => void;
   reset: () => void;
 };
 
+const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
+const SESSION_KEY = 'dots_and_boxes_session_v1';
+const MIN_SIZE = 2;
+const MAX_SIZE = 8;
+
+function loadSession(): SessionState | null {
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as SessionState;
+    if (!parsed.roomId || !parsed.playerToken) {
+      return null;
+    }
+
+    return parsed;
+  } catch {
+    sessionStorage.removeItem(SESSION_KEY);
+    return null;
+  }
+}
+
+const INITIAL_SESSION = loadSession();
+
+// 地址栏与房间同步：开房/进房后 URL 带 ?room=，可直接分享；退回首页时清除
+function syncRoomUrl(roomId: string | null): void {
+  try {
+    const url = roomId ? `${window.location.pathname}?room=${roomId}` : window.location.pathname;
+    window.history.replaceState(null, '', url);
+  } catch {
+    // 某些嵌入环境不允许改地址，忽略即可
+  }
+}
+
+function readRoomParam(): string | null {
+  try {
+    const entry = [...new URLSearchParams(window.location.search).entries()].find(
+      ([key]) => key.toLowerCase() === 'room',
+    );
+    return entry?.[1]?.toUpperCase() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// 玩家身份令牌：按昵称绑定并持久化到 localStorage，同一浏览器同一昵称视为同一人，
+// 掉线后凭它恢复对局；换浏览器/换昵称则是新用户（座位被占时需等待）。
+type PlayerIdentity = { name: string; token: string };
+const IDENTITY_KEY = 'dots_and_boxes_identity_v1';
+
+function readIdentity(): PlayerIdentity | null {
+  try {
+    const raw = localStorage.getItem(IDENTITY_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as PlayerIdentity;
+    if (!parsed?.name || !parsed?.token) {
+      return null;
+    }
+
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function saveIdentity(identity: PlayerIdentity): void {
+  try {
+    localStorage.setItem(IDENTITY_KEY, JSON.stringify(identity));
+  } catch {
+    // localStorage 不可用（如隐私模式）时忽略，退化为普通会话行为
+  }
+}
+
 const useGameStore = create<StoreState>((set) => ({
   room: null,
-  playerSymbol: null,
-  systemMessage: '请输入昵称并创建或加入房间。',
+  playerSymbol: INITIAL_SESSION?.playerSymbol ?? null,
+  systemMessages: [],
   setRoom: (room) => set({ room }),
   setPlayerSymbol: (playerSymbol) => set({ playerSymbol }),
-  setSystemMessage: (systemMessage) => set({ systemMessage }),
+  pushSystemMessage: (text) => {
+    const id = Date.now() + Math.random();
+    set((s) => ({ systemMessages: [...s.systemMessages, { id, text }].slice(-4) }));
+    window.setTimeout(() => {
+      set((s) => ({ systemMessages: s.systemMessages.filter((m) => m.id !== id) }));
+    }, 6000);
+  },
   reset: () =>
     set({
       room: null,
       playerSymbol: null,
-      systemMessage: '请输入昵称并创建或加入房间。',
+      systemMessages: [],
     }),
 }));
 
-const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
-const SESSION_KEY = 'dots_and_boxes_session_v1';
-const THEME_KEY = 'dots_and_boxes_theme_mode';
-const MIN_SIZE = 2;
-const MAX_SIZE = 8;
-const DOT_SIZE = 14;
-const EDGE_SPAN = 70;
-const MIN_WINNER_PANEL_SPACE = 300;
+// 页面随机标识：服务端用它区分"同页面断线重连"与"另一个标签页抢会话"
+const TAB_NONCE = Math.random().toString(36).slice(2);
 
 function edgeId(orientation: 'h' | 'v', row: number, col: number): string {
   return `${orientation}-${row}-${col}`;
@@ -129,74 +228,50 @@ function parseBoardSpec(spec: string): { rows: number; cols: number } | null {
 
 function App() {
   const socketRef = useRef<Socket | null>(null);
-  const boardWrapRef = useRef<HTMLElement | null>(null);
-  const [playerName, setPlayerName] = useState('');
-  const [roomIdInput, setRoomIdInput] = useState('');
+  const chatListRef = useRef<HTMLDivElement | null>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const [playerName, setPlayerName] = useState(INITIAL_SESSION?.playerName ?? readIdentity()?.name ?? '');
+  const [roomIdInput, setRoomIdInput] = useState(() => {
+    // 支持 ?room=XXXX / ?ROOM=xxxx 分享链接：URL 参数优先于本地会话
+    return (readRoomParam() ?? INITIAL_SESSION?.roomId ?? '').toUpperCase();
+  });
   const [boardSpec, setBoardSpec] = useState('');
   const [chatInput, setChatInput] = useState('');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [showWinnerPanel, setShowWinnerPanel] = useState(false);
-  const [playerToken, setPlayerToken] = useState('');
+  const [playerToken, setPlayerToken] = useState(INITIAL_SESSION?.playerToken ?? '');
   const [rollingDice, setRollingDice] = useState(false);
   const [starterModal, setStarterModal] = useState<{ show: boolean; text: string }>({
     show: false,
     text: '',
   });
   const [selectedHistoryRound, setSelectedHistoryRound] = useState<number | null>(null);
-  const [themeMode, setThemeMode] = useState<ThemeMode>('system');
-  const [effectiveTheme, setEffectiveTheme] = useState<'light' | 'dark'>('light');
+  const [replayStep, setReplayStep] = useState<number | null>(null);
+  const [replayAuto, setReplayAuto] = useState(false);
+  const [copiedRoom, setCopiedRoom] = useState(false);
+  const [rulesOpen, setRulesOpen] = useState(false);
 
   const room = useGameStore((s) => s.room);
   const playerSymbol = useGameStore((s) => s.playerSymbol);
-  const systemMessage = useGameStore((s) => s.systemMessage);
+  const systemMessages = useGameStore((s) => s.systemMessages);
   const setRoom = useGameStore((s) => s.setRoom);
   const setPlayerSymbol = useGameStore((s) => s.setPlayerSymbol);
-  const setSystemMessage = useGameStore((s) => s.setSystemMessage);
+  const pushSystemMessage = useGameStore((s) => s.pushSystemMessage);
   const resetStore = useGameStore((s) => s.reset);
 
   useEffect(() => {
-    const saved = localStorage.getItem(THEME_KEY);
-    if (saved === 'light' || saved === 'dark' || saved === 'system') {
-      setThemeMode(saved);
+    if (!rulesOpen) {
+      return;
     }
-  }, []);
 
-  useEffect(() => {
-    const media = window.matchMedia('(prefers-color-scheme: dark)');
-    const applyTheme = () => {
-      const resolved: 'light' | 'dark' =
-        themeMode === 'system' ? (media.matches ? 'dark' : 'light') : themeMode;
-      document.documentElement.setAttribute('data-theme', resolved);
-      setEffectiveTheme(resolved);
-    };
-
-    applyTheme();
-
-    const onChange = () => {
-      if (themeMode === 'system') {
-        applyTheme();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setRulesOpen(false);
       }
     };
 
-    if (media.addEventListener) {
-      media.addEventListener('change', onChange);
-    } else {
-      media.addListener(onChange);
-    }
-
-    return () => {
-      if (media.removeEventListener) {
-        media.removeEventListener('change', onChange);
-      } else {
-        media.removeListener(onChange);
-      }
-    };
-  }, [themeMode]);
-
-  function updateThemeMode(mode: ThemeMode): void {
-    setThemeMode(mode);
-    localStorage.setItem(THEME_KEY, mode);
-  }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [rulesOpen]);
 
   useEffect(() => {
     const socket = io(SERVER_URL, {
@@ -206,7 +281,7 @@ function App() {
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      setSystemMessage('已连接服务器，可创建或加入房间。');
+      pushSystemMessage('已连接服务器，可创建或加入房间。');
 
       const raw = sessionStorage.getItem(SESSION_KEY);
       if (!raw) {
@@ -231,6 +306,7 @@ function App() {
           roomId: parsed.roomId,
           playerToken: parsed.playerToken,
           playerName: parsed.playerName,
+          nonce: TAB_NONCE,
         },
         (response: { ok: boolean; symbol?: PlayerSymbol; playerToken?: string; message?: string }) => {
           if (!response.ok) {
@@ -240,13 +316,13 @@ function App() {
             setPlayerToken('');
             setSelectedHistoryRound(null);
             setRoomIdInput('');
-            setSystemMessage(response.message || '重连失败，已返回首页。');
+            pushSystemMessage(response.message || '重连失败，已返回首页。');
             return;
           }
 
           setPlayerSymbol(response.symbol || parsed.playerSymbol);
           setPlayerToken(response.playerToken || parsed.playerToken);
-          setSystemMessage('已自动恢复到上次房间。');
+          pushSystemMessage('已自动恢复到上次房间。');
         },
       );
     });
@@ -260,33 +336,38 @@ function App() {
       setChatMessages((prev) => [...prev.slice(-79), payload]);
     });
 
-    socket.on('dice_tie', (payload: { message?: string }) => {
-      setRollingDice(false);
-      setSystemMessage(payload.message || '骰子点数相同，请重新掷骰。');
-    });
-
     socket.on('dice_decided', (payload: DiceDecisionPayload) => {
       setRollingDice(false);
-      setSystemMessage(payload.message || `${payload.starter} 方先手`);
+      pushSystemMessage(payload.message || `${payload.starter} 方先手`);
       setStarterModal({
         show: true,
         text: payload.message || `${payload.starter} 方先手，比赛开始`,
       });
     });
 
+    socket.on('round_reset', (payload: { message?: string }) => {
+      setSelectedHistoryRound(null);
+      setStarterModal({ show: false, text: '' });
+      pushSystemMessage(payload.message || '新一局已就绪。');
+    });
+
+    socket.on('board_proposal_result', (payload: { message?: string }) => {
+      pushSystemMessage(payload.message || '棋盘提议已处理。');
+    });
+
     socket.on('player_left', (payload: { message?: string }) => {
-      setSystemMessage(payload.message || '有玩家离开房间。');
+      pushSystemMessage(payload.message || '有玩家离开房间。');
     });
 
     socket.on('disconnect', () => {
       setRollingDice(false);
-      setSystemMessage('与服务器连接断开，请刷新重连。');
+      pushSystemMessage('与服务器连接断开，请刷新重连。');
     });
 
     return () => {
       socket.disconnect();
     };
-  }, [setPlayerSymbol, setRoom, setSystemMessage]);
+  }, [resetStore, setPlayerSymbol, setRoom, pushSystemMessage]);
 
   const parsedInputBoard = parseBoardSpec(boardSpec);
   const selectedRound =
@@ -315,20 +396,56 @@ function App() {
   const bothPlayersReady = Boolean(room?.readyBySymbol?.A && room?.readyBySymbol?.B);
   const roundHistory = room?.roundHistory ?? [];
 
+  const voteA = room?.nextRoundVotes?.A ?? false;
+  const voteB = room?.nextRoundVotes?.B ?? false;
+  const myVote = playerSymbol === 'A' ? voteA : playerSymbol === 'B' ? voteB : false;
+
   const displayStatus = selectedRound ? 'finished' : room?.status;
   const displayWinner = selectedRound?.winner ?? room?.winner;
   const displayStarter = selectedRound?.starter ?? room?.starter ?? null;
   const displayScores = selectedRound?.scores ?? room?.scores ?? { A: 0, B: 0 };
   const displayClaimedEdges = selectedRound?.finalClaimedEdges ?? room?.claimedEdges ?? {};
   const displayClaimedBoxes = selectedRound?.finalClaimedBoxes ?? room?.claimedBoxes ?? {};
-  const displayRoundNumber = selectedRound?.roundNumber ?? room?.roundNumber ?? 1;
 
+  // 回放模式：按落子顺序截断到第 replayStep 手（盒子归属=完成该盒的那条边的主人）
+  let shownEdges = displayClaimedEdges;
+  let shownBoxes = displayClaimedBoxes;
+  if (viewingHistory && selectedRound?.moveOrder && replayStep !== null) {
+    const seq = selectedRound.moveOrder.slice(0, replayStep);
+    const edges: Record<string, PlayerSymbol> = {};
+    seq.forEach((eid) => {
+      const owner = selectedRound.finalClaimedEdges[eid];
+      if (owner) {
+        edges[eid] = owner;
+      }
+    });
+    const boxes: Record<string, PlayerSymbol> = {};
+    Object.entries(selectedRound.finalClaimedBoxes).forEach(([boxKey, owner]) => {
+      const [r, c] = boxKey.split('-').map(Number);
+      const four = [`h-${r}-${c}`, `h-${r + 1}-${c}`, `v-${r}-${c}`, `v-${r}-${c + 1}`];
+      const idxs = four.map((e) => seq.indexOf(e));
+      if (idxs.every((i) => i >= 0)) {
+        const lastIdx = Math.max(...idxs);
+        boxes[boxKey] = selectedRound.finalClaimedEdges[four[idxs.indexOf(lastIdx)]] ?? owner;
+      }
+    });
+    shownEdges = edges;
+    shownBoxes = boxes;
+  }
+  const displayRoundNumber = selectedRound?.roundNumber ?? room?.roundNumber ?? 1;
   const canMakeMove = useMemo(() => {
     if (!room || !playerSymbol || viewingHistory) {
       return false;
     }
     return room.status === 'playing' && room.currentTurn === playerSymbol;
   }, [playerSymbol, room, viewingHistory]);
+
+  const restartAvailable = Boolean(
+    room && playerSymbol && !viewingHistory && (displayStatus === 'playing' || displayStatus === 'finished'),
+  );
+
+  // 开局前的等待阶段允许协商棋盘规格；每局重开回到等待阶段后可再次提议
+  const canProposeBoard = Boolean(room && playerSymbol && room.status === 'waiting' && !viewingHistory);
 
   const statusDisplayText =
     displayStatus === 'waiting'
@@ -342,52 +459,6 @@ function App() {
           : displayStatus === 'finished'
             ? '对局已结束'
             : 'idle';
-
-  const turnDisplayText = displayStatus === 'playing' ? room?.currentTurn ?? '-' : '-';
-
-  const starterDisplayText =
-    displayStarter ??
-    (displayStatus === 'rolling' ? '待定（掷骰中）' : displayStatus === 'waiting' ? '待定（未开局）' : '-');
-
-  const resultDisplayText =
-    displayStatus === 'finished'
-      ? displayWinner === 'draw'
-        ? '平局'
-        : displayWinner
-          ? `${displayWinner} 获胜`
-          : '对局结束'
-      : displayStatus === 'rolling'
-        ? '等待双方掷骰'
-        : displayStatus === 'waiting'
-          ? (room?.players.length ?? 0) < 2
-            ? '等待玩家加入'
-            : '等待双方准备'
-          : '对局进行中';
-
-  useEffect(() => {
-    try {
-      const raw = sessionStorage.getItem(SESSION_KEY);
-      if (!raw) {
-        return;
-      }
-
-      const parsed = JSON.parse(raw) as SessionState;
-      if (parsed.playerName) {
-        setPlayerName(parsed.playerName);
-      }
-      if (parsed.roomId) {
-        setRoomIdInput(parsed.roomId);
-      }
-      if (parsed.playerToken) {
-        setPlayerToken(parsed.playerToken);
-      }
-      if (parsed.playerSymbol) {
-        setPlayerSymbol(parsed.playerSymbol);
-      }
-    } catch {
-      sessionStorage.removeItem(SESSION_KEY);
-    }
-  }, [setPlayerSymbol]);
 
   useEffect(() => {
     if (!room || !playerToken || !playerSymbol || !playerName.trim()) {
@@ -405,50 +476,32 @@ function App() {
   }, [playerName, playerSymbol, playerToken, room]);
 
   useEffect(() => {
-    if (!room || selectedHistoryRound === null) {
-      return;
+    const el = chatListRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
     }
+  }, [chatMessages]);
 
-    const stillExists = room.roundHistory.some((item) => item.roundNumber === selectedHistoryRound);
-    if (!stillExists) {
-      setSelectedHistoryRound(null);
-    }
-  }, [room, selectedHistoryRound]);
-
+  // 自动回放：逐步前进到终局（到终点自动停止）
   useEffect(() => {
-    if (displayStatus !== 'finished') {
-      setShowWinnerPanel(false);
+    if (!replayAuto || !viewingHistory || replayStep === null) {
       return;
     }
 
-    const container = boardWrapRef.current;
-    if (!container) {
+    const total = selectedRound?.moveOrder?.length ?? 0;
+    if (replayStep >= total) {
       return;
     }
 
-    const updateWinnerPanelVisibility = () => {
-      const estimatedBoardWidth = cols * (DOT_SIZE + EDGE_SPAN) + DOT_SIZE;
-      const availableSpace = container.clientWidth - estimatedBoardWidth;
-      setShowWinnerPanel(availableSpace >= MIN_WINNER_PANEL_SPACE);
-    };
-
-    updateWinnerPanelVisibility();
-
-    const observer = new ResizeObserver(() => {
-      updateWinnerPanelVisibility();
-    });
-
-    observer.observe(container);
-    return () => {
-      observer.disconnect();
-    };
-  }, [cols, displayStatus]);
-
-  useEffect(() => {
-    if (displayStatus !== 'rolling' || myDice !== null) {
-      setRollingDice(false);
-    }
-  }, [displayStatus, myDice]);
+    const timer = window.setTimeout(() => {
+      const next = replayStep + 1;
+      setReplayStep(next);
+      if (next >= total) {
+        setReplayAuto(false);
+      }
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [replayAuto, viewingHistory, replayStep, selectedRound]);
 
   useEffect(() => {
     const socket = socketRef.current;
@@ -460,6 +513,7 @@ function App() {
       socket.emit('presence_ping', {
         roomId: room.roomId,
         playerToken,
+        nonce: TAB_NONCE,
       });
     };
 
@@ -476,15 +530,127 @@ function App() {
     }
 
     const allOnline = room.players.length === 2 && room.players.every((p) => p.connected !== false);
-    if (allOnline && systemMessage.includes('暂时离线')) {
-      setSystemMessage('双方在线，可继续对局。');
+    const offlineNoticeShown = systemMessages.some((m) => m.text.includes('暂时离线'));
+    const onlineNoticeShown = systemMessages.some((m) => m.text.includes('双方在线'));
+    if (allOnline && offlineNoticeShown && !onlineNoticeShown) {
+      pushSystemMessage('双方在线，可继续对局。');
     }
-  }, [room, setSystemMessage, systemMessage]);
+  }, [room, pushSystemMessage, systemMessages]);
 
   const winnerDisplayText =
     displayWinner === 'draw' ? '平局' : displayWinner ? `${displayWinner} 方胜利` : '对局结束';
   const winnerName =
     displayWinner === 'A' ? playerA?.name : displayWinner === 'B' ? playerB?.name : undefined;
+
+  const aActive = Boolean(displayStatus === 'playing' && !viewingHistory && room?.currentTurn === 'A');
+  const bActive = Boolean(displayStatus === 'playing' && !viewingHistory && room?.currentTurn === 'B');
+
+  let medalKind: 'a' | 'b' | 'neutral' = 'neutral';
+  let medalSymbol: string = '⏳';
+  let medalLabel: string = (room?.players.length ?? 0) < 2 ? '等待加入' : '待准备';
+  if (displayStatus === 'playing') {
+    medalKind = room?.currentTurn === 'A' ? 'a' : 'b';
+    medalSymbol = medalKind.toUpperCase();
+    medalLabel = '当前回合';
+  } else if (displayStatus === 'rolling') {
+    medalSymbol = '🎲';
+    medalLabel = '掷骰中';
+  } else if (displayStatus === 'finished') {
+    if (displayWinner === 'A' || displayWinner === 'B') {
+      medalKind = displayWinner === 'A' ? 'a' : 'b';
+      medalSymbol = '🏆';
+      medalLabel = `${displayWinner} 获胜`;
+    } else {
+      medalSymbol = '🤝';
+      medalLabel = '平局';
+    }
+  }
+
+  const bannerText =
+    displayStatus === 'playing'
+      ? canMakeMove
+        ? '🎯 轮到你了！点击棋盘上的边线落子'
+        : `等待 ${room?.currentTurn ?? '-'} 方行动…`
+      : displayStatus === 'rolling'
+        ? '🎲 双方掷骰决定先手中…'
+        : displayStatus === 'finished'
+          ? `对局结束：${winnerDisplayText}`
+          : (room?.players.length ?? 0) < 2
+            ? '等待对手加入房间…'
+            : '双方都点“准备开始”后进入掷骰阶段';
+
+  const bannerKind =
+    displayStatus === 'playing'
+      ? room?.currentTurn === 'A'
+        ? 'a'
+        : 'b'
+      : displayStatus === 'finished'
+        ? 'finished'
+        : 'idle';
+
+  const starterChipText = displayStarter
+    ? `先手 ${displayStarter}`
+    : displayStatus === 'rolling'
+      ? '先手 掷骰中'
+      : '先手 未定';
+
+  const totalMoves = selectedRound?.moveOrder?.length ?? 0;
+  const isSpectator = Boolean(room && !playerSymbol);
+  // 首局开局门槛：规格须经双方协商同意后才能准备
+  const needsSpecAgreement = Boolean(
+    room && playerSymbol && room.status === 'waiting' && room.specAgreed === false,
+  );
+  const pendingProposalForMe = room?.boardProposal ?? null;
+
+  function confirmSpec(): void {
+    if (!room) {
+      return;
+    }
+
+    const socket = socketRef.current;
+    if (!socket) {
+      return;
+    }
+
+    socket.emit(
+      'confirm_spec',
+      { roomId: room.roomId },
+      (response: { ok: boolean; rows?: number; cols?: number; message?: string }) => {
+        if (!response.ok) {
+          pushSystemMessage(response.message || '确认规格失败。');
+          return;
+        }
+
+        pushSystemMessage(`已沿用 ${response.rows}*${response.cols} 规格，可以准备开局了。`);
+      },
+    );
+  }
+
+  function selectHistoryRound(roundNumber: number | null): void {
+    setSelectedHistoryRound(roundNumber);
+    setReplayAuto(false);
+    setReplayStep(null);
+  }
+
+  function copyRoomId(): void {
+    const id = room?.roomId;
+    if (!id) {
+      return;
+    }
+
+    if (!navigator.clipboard) {
+      pushSystemMessage('当前环境不支持复制，请手动记录房间号。');
+      return;
+    }
+
+    navigator.clipboard
+      .writeText(`${window.location.origin}${window.location.pathname}?room=${id}`)
+      .then(() => {
+        setCopiedRoom(true);
+        window.setTimeout(() => setCopiedRoom(false), 1600);
+      })
+      .catch(() => pushSystemMessage('复制失败，请手动记录房间号。'));
+  }
 
   function createRoom(): void {
     const socket = socketRef.current;
@@ -493,21 +659,26 @@ function App() {
     }
 
     if (!playerName.trim()) {
-      setSystemMessage('请先输入昵称。');
+      pushSystemMessage('请先输入昵称。');
       return;
     }
 
-    const parsed = parseBoardSpec(boardSpec);
+    // 规格可留空：默认 4*4，进房后可在开局前与对方协商修改
+    const parsed = boardSpec.trim() ? parseBoardSpec(boardSpec) : { rows: 4, cols: 4 };
     if (!parsed) {
-      setSystemMessage('棋盘格式请使用 m*n，且 m、n 范围为 2 到 8，例如 4*8。');
+      pushSystemMessage('棋盘格式请使用 m*n，且 m、n 范围为 2 到 8，例如 4*8。');
       return;
     }
+
+    const trimmedName = playerName.trim();
+    const remembered = readIdentity();
+    const tokenToSend = playerToken || (remembered?.name === trimmedName ? remembered.token : undefined);
 
     socket.emit(
       'create_room',
       {
-        playerName: playerName.trim(),
-        playerToken: playerToken || undefined,
+        playerName: trimmedName,
+        playerToken: tokenToSend,
         boardRows: parsed.rows,
         boardCols: parsed.cols,
       },
@@ -519,16 +690,22 @@ function App() {
         message?: string;
       }) => {
         if (!response.ok) {
-          setSystemMessage(response.message || '创建房间失败。');
+          pushSystemMessage(response.message || '创建房间失败。');
           return;
         }
 
+        if (response.playerToken) {
+          saveIdentity({ name: trimmedName, token: response.playerToken });
+        }
         setPlayerSymbol(response.symbol || null);
         setPlayerToken(response.playerToken || playerToken);
         setRoomIdInput(response.roomId || '');
         setSelectedHistoryRound(null);
         setChatMessages([]);
-        setSystemMessage(`房间已创建：${response.roomId}，等待对手加入。`);
+        syncRoomUrl(response.roomId ?? null);
+        pushSystemMessage(
+          `房间已创建：${response.roomId}（当前规格 ${parsed.rows}*${parsed.cols}，开局前需双方协商确认）`,
+        );
       },
     );
   }
@@ -540,47 +717,68 @@ function App() {
     }
 
     if (!playerName.trim()) {
-      setSystemMessage('请先输入昵称。');
+      pushSystemMessage('请先输入昵称。');
       return;
     }
 
     if (!roomIdInput.trim()) {
-      setSystemMessage('请输入房间号。');
+      pushSystemMessage('请输入房间号。');
       return;
     }
+
+    const trimmedName = playerName.trim();
+    const remembered = readIdentity();
+    const tokenToSend = playerToken || (remembered?.name === trimmedName ? remembered.token : undefined);
 
     socket.emit(
       'join_room',
       {
         roomId: roomIdInput.trim().toUpperCase(),
-        playerName: playerName.trim(),
-        playerToken: playerToken || undefined,
+        playerName: trimmedName,
+        playerToken: tokenToSend,
+        nonce: TAB_NONCE,
       },
       (response: {
         ok: boolean;
         roomId?: string;
         symbol?: PlayerSymbol;
         playerToken?: string;
+        spectator?: boolean;
         message?: string;
       }) => {
         if (!response.ok) {
-          setSystemMessage(response.message || '加入房间失败。');
+          pushSystemMessage(response.message || '加入房间失败。');
           return;
         }
 
+        if (response.spectator) {
+          setPlayerSymbol(null);
+          setPlayerToken('');
+          setRoomIdInput(response.roomId || roomIdInput.trim().toUpperCase());
+          setSelectedHistoryRound(null);
+          setChatMessages([]);
+          syncRoomUrl(response.roomId ?? null);
+          pushSystemMessage('房间满员，已以旁观者身份进入（只读，可查看棋盘与聊天）');
+          return;
+        }
+
+        if (response.playerToken) {
+          saveIdentity({ name: trimmedName, token: response.playerToken });
+        }
         setPlayerSymbol(response.symbol || null);
         setPlayerToken(response.playerToken || playerToken);
         setRoomIdInput(response.roomId || roomIdInput.trim().toUpperCase());
         setSelectedHistoryRound(null);
         setChatMessages([]);
-        setSystemMessage(`成功加入房间：${response.roomId}。`);
+        syncRoomUrl(response.roomId ?? null);
+        pushSystemMessage(`成功加入房间：${response.roomId}（开局前需与对方协商棋盘规格）`);
       },
     );
   }
 
   function toggleReady(): void {
     if (!room || !playerSymbol) {
-      setSystemMessage('先加入房间后再准备。');
+      pushSystemMessage('先加入房间后再准备。');
       return;
     }
 
@@ -594,7 +792,7 @@ function App() {
       { roomId: room.roomId, ready: !myReady },
       (response: { ok: boolean; message?: string }) => {
         if (!response.ok) {
-          setSystemMessage(response.message || '设置准备状态失败。');
+          pushSystemMessage(response.message || '设置准备状态失败。');
         }
       },
     );
@@ -617,14 +815,44 @@ function App() {
       (response: { ok: boolean; message?: string }) => {
         setRollingDice(false);
         if (!response.ok) {
-          setSystemMessage(response.message || '掷骰失败。');
+          pushSystemMessage(response.message || '掷骰失败。');
         }
       },
     );
   }
 
-  function startNextRound(): void {
-    if (!room || viewingHistory) {
+  function proposeBoard(): void {
+    if (!room || !canProposeBoard) {
+      return;
+    }
+
+    const socket = socketRef.current;
+    if (!socket) {
+      return;
+    }
+
+    const parsed = parseBoardSpec(boardSpec);
+    if (!parsed) {
+      pushSystemMessage('提议的棋盘格式须为 m*n，m、n 取值 2 到 8，例如 5*4。');
+      return;
+    }
+
+    socket.emit(
+      'propose_board',
+      { roomId: room.roomId, rows: parsed.rows, cols: parsed.cols },
+      (response: { ok: boolean; message?: string }) => {
+        if (!response.ok) {
+          pushSystemMessage(response.message || '提议失败。');
+          return;
+        }
+
+        pushSystemMessage(`已向对方提议棋盘 ${parsed.rows}*${parsed.cols}，等待对方在聊天中回应。`);
+      },
+    );
+  }
+
+  function respondBoard(proposalId: number, accept: boolean): void {
+    if (!room) {
       return;
     }
 
@@ -634,24 +862,112 @@ function App() {
     }
 
     socket.emit(
-      'start_next_round',
-      { roomId: room.roomId },
-      (response: { ok: boolean; roundNumber?: number; message?: string }) => {
+      'respond_board',
+      { roomId: room.roomId, proposalId, accept },
+      (response: { ok: boolean; message?: string }) => {
         if (!response.ok) {
-          setSystemMessage(response.message || '开启新对局失败。');
-          return;
+          pushSystemMessage(response.message || '回应提议失败。');
         }
-
-        setSelectedHistoryRound(null);
-        setStarterModal({ show: false, text: '' });
-        setSystemMessage(`已开启第 ${response.roundNumber ?? (room.roundNumber + 1)} 局。`);
       },
     );
   }
 
-  function sendChat(): void {
+  function clearChat(): void {
     if (!room) {
-      setSystemMessage('先加入房间后再发送消息。');
+      return;
+    }
+
+    const socket = socketRef.current;
+    if (!socket) {
+      return;
+    }
+
+    socket.emit('clear_chat', { roomId: room.roomId }, (response: { ok: boolean; message?: string }) => {
+      if (!response.ok) {
+        pushSystemMessage(response.message || '清空聊天失败。');
+      }
+    });
+  }
+
+  function renderChatBody(item: ChatMessage) {
+    if (item.kind === 'board-proposal' && item.proposal) {
+      const proposal = item.proposal;
+      const mine = item.senderSymbol === playerSymbol;
+      return (
+        <div className="chat-proposal">
+          <span className="chat-text">{item.message}</span>
+          <span className={`proposal-status proposal-${proposal.status}`}>
+            {proposal.status === 'pending'
+              ? mine
+                ? '等待对方回应…'
+                : '请在下方回应'
+              : proposal.status === 'accepted'
+                ? '✓ 已同意，规格已生效'
+                : '✗ 已拒绝'}
+          </span>
+          {proposal.status === 'pending' && !mine && (
+            <div className="proposal-actions">
+              <button type="button" onClick={() => respondBoard(proposal.id, true)}>
+                同意
+              </button>
+              <button type="button" className="secondary" onClick={() => respondBoard(proposal.id, false)}>
+                拒绝
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    return <span className="chat-text">{item.message}</span>;
+  }
+
+  function voteNextRound(): void {    if (!room) {
+      return;
+    }
+
+    const socket = socketRef.current;
+    if (!socket) {
+      return;
+    }
+
+    socket.emit(
+      'vote_next_round',
+      { roomId: room.roomId },
+      (response: { ok: boolean; voted?: boolean; message?: string }) => {
+        if (!response.ok) {
+          pushSystemMessage(response.message || '重开投票失败。');
+          return;
+        }
+
+        pushSystemMessage(
+          response.voted
+            ? '你已同意重开，等待对方同意…（再次点击可撤回）'
+            : '已撤回重开同意。',
+        );
+      },
+    );
+  }
+
+  // Shift/Ctrl+Enter 在光标处插入换行；手动插入以保证各浏览器（含 Ctrl+Enter 无默认行为的）表现一致
+  function insertNewlineAtCaret(): void {
+    const el = chatInputRef.current;
+    if (!el) {
+      setChatInput((prev) => `${prev}\n`);
+      return;
+    }
+
+    const start = el.selectionStart ?? chatInput.length;
+    const end = el.selectionEnd ?? chatInput.length;
+    setChatInput(`${chatInput.slice(0, start)}\n${chatInput.slice(end)}`);
+    window.requestAnimationFrame(() => {
+      el.selectionStart = start + 1;
+      el.selectionEnd = start + 1;
+    });
+  }
+
+  function sendChat(): void {    if (!room) {
+      pushSystemMessage('先加入房间后再发送消息。');
       return;
     }
 
@@ -670,7 +986,7 @@ function App() {
       { roomId: room.roomId, message },
       (response: { ok: boolean; message?: string }) => {
         if (!response.ok) {
-          setSystemMessage(response.message || '发送消息失败。');
+          pushSystemMessage(response.message || '发送消息失败。');
           return;
         }
 
@@ -694,7 +1010,7 @@ function App() {
       { roomId: room.roomId, edgeId: targetEdgeId },
       (response: { ok: boolean; message?: string }) => {
         if (!response.ok) {
-          setSystemMessage(response.message || '落子失败。');
+          pushSystemMessage(response.message || '落子失败。');
         }
       },
     );
@@ -712,137 +1028,202 @@ function App() {
     setRollingDice(false);
     setStarterModal({ show: false, text: '' });
     setSelectedHistoryRound(null);
+    syncRoomUrl(null);
   }
 
   return (
     <div className="page">
       <header className="hero">
-        <div className="theme-switch" role="group" aria-label="主题切换">
-          <button
-            type="button"
-            className={`theme-btn ${themeMode === 'light' ? 'theme-btn-active' : ''}`}
-            onClick={() => updateThemeMode('light')}
-          >
-            浅色
-          </button>
-          <button
-            type="button"
-            className={`theme-btn ${themeMode === 'dark' ? 'theme-btn-active' : ''}`}
-            onClick={() => updateThemeMode('dark')}
-          >
-            深色
-          </button>
-          <button
-            type="button"
-            className={`theme-btn ${themeMode === 'system' ? 'theme-btn-active' : ''}`}
-            onClick={() => updateThemeMode('system')}
-          >
-            跟随系统{themeMode === 'system' ? `(${effectiveTheme === 'dark' ? '深' : '浅'})` : ''}
-          </button>
-        </div>
+        <button type="button" className="rules-btn" onClick={() => setRulesOpen(true)}>
+          查看规则
+        </button>
         <h1>Dots and Boxes</h1>
       </header>
 
       <div className="layout">
         <aside className="panel controls">
-          <div className="field-row">
-            <label htmlFor="name">昵称</label>
-            <input
-              id="name"
-              value={playerName}
-              onChange={(e) => setPlayerName(e.target.value)}
-              placeholder="例如：Alice"
-              maxLength={20}
-              disabled={hasActiveRoom}
-            />
-          </div>
+          <section className="side-section">
+            <div className="side-title">房间</div>
+            <div className="field-row">
+              <label htmlFor="name">昵称</label>
+              <input
+                id="name"
+                value={playerName}
+                onChange={(e) => setPlayerName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                    e.currentTarget.blur();
+                  }
+                }}
+                placeholder="例如：Alice"
+                maxLength={20}
+                disabled={hasActiveRoom}
+              />
+            </div>
 
-          <div className="field-row">
-            <label htmlFor="size">棋盘规格</label>
-            <input
-              id="size"
-              value={hasActiveRoom ? `${rows}*${cols}` : boardSpec}
-              onChange={(e) => setBoardSpec(e.target.value)}
-              placeholder="请输入 m*n"
-              disabled={viewingHistory || hasActiveRoom}
-            />
-            <button type="button" onClick={createRoom} disabled={hasActiveRoom}>
-              创建房间
-            </button>
-          </div>
-          <p className="hint">格式：m*n，且 m、n 取值范围为 2 到 8（例如 4*5）。</p>
+            <div
+              key={room?.roomId ?? 'lobby'}
+              className={`field-row ${
+                canProposeBoard && playerSymbol ? `spec-row-active spec-${playerSymbol.toLowerCase()}` : ''
+              }`}
+            >
+              <label htmlFor="size">规格</label>
+              <input
+                id="size"
+                value={hasActiveRoom ? (canProposeBoard ? boardSpec : `${rows}*${cols}`) : boardSpec}
+                onChange={(e) => setBoardSpec(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter' || e.nativeEvent.isComposing) {
+                    return;
+                  }
+                  e.preventDefault();
+                  if (!hasActiveRoom) {
+                    createRoom();
+                  } else if (canProposeBoard) {
+                    proposeBoard();
+                  }
+                  e.currentTarget.blur();
+                }}
+                placeholder="m*n，如 4*5"
+                disabled={viewingHistory || (hasActiveRoom && !canProposeBoard)}
+              />
+              {!hasActiveRoom ? (
+                <button type="button" onClick={createRoom}>
+                  创建房间
+                </button>
+              ) : canProposeBoard ? (
+                <button type="button" onClick={proposeBoard}>
+                  提议规格
+                </button>
+              ) : null}
+            </div>
 
-          <div className="field-row">
-            <label htmlFor="room">房间号</label>
-            <input
-              id="room"
-              value={roomIdInput}
-              onChange={(e) => setRoomIdInput(e.target.value.toUpperCase())}
-              placeholder="输入 6 位房间号"
-              disabled={hasActiveRoom}
-            />
-            <button type="button" onClick={joinRoom} disabled={hasActiveRoom}>
-              加入房间
-            </button>
-          </div>
+            <div className="field-row">
+              <label htmlFor="room">房号</label>
+              <input
+                id="room"
+                value={roomIdInput}
+                onChange={(e) => setRoomIdInput(e.target.value.toUpperCase())}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                    if (roomIdInput.trim() && !hasActiveRoom) {
+                      joinRoom();
+                    }
+                    e.currentTarget.blur();
+                  }
+                }}
+                placeholder="6 位房间号"
+                disabled={hasActiveRoom}
+              />
+              <button type="button" onClick={joinRoom} disabled={hasActiveRoom}>
+                加入房间
+              </button>
+            </div>
+            {!hasActiveRoom && <p className="hint">创建可留空（默认 4*4）；m、n 取值 2 到 8。</p>}
+            {hasActiveRoom && !canProposeBoard && (
+              <p className="hint">规格已锁定，下一局开始前可再协商。</p>
+            )}
+          </section>
 
-          <div className="field-row">
-            <button type="button" onClick={toggleReady} className={myReady ? 'ready-btn ready-on' : 'ready-btn'}>
-              {myReady ? '取消准备' : '准备开始'}
-            </button>
-            {room?.status === 'rolling' && (
+          <section className="side-section">
+            <div className="side-title">操作</div>
+            <div className="action-stack">
               <button
                 type="button"
-                onClick={rollDice}
-                className={`dice-btn ${rollingDice ? 'dice-rolling' : ''}`}
-                disabled={!canRollDice || rollingDice}
+                onClick={toggleReady}
+                className={myReady ? 'ready-btn ready-on block-btn' : 'ready-btn block-btn'}
+                disabled={needsSpecAgreement}
+                title={needsSpecAgreement ? '需先协商棋盘规格' : undefined}
               >
-                {rollingDice ? '掷骰中...' : isTieAwaitingReroll ? '重新掷骰' : '掷骰决定先手'}
+                {myReady ? '取消准备' : '准备开始'}
               </button>
-            )}
-            <button type="button" onClick={resetLocal} className="secondary">
-              退回首页
-            </button>
-          </div>
-
-          {room?.players.length === 2 && room?.status === 'waiting' && (
-            <p className="message">双方都点击“准备开始”后，将进入掷骰决定先手阶段。</p>
-          )}
-
-          <p className="message">{systemMessage}</p>
-
-          <section className="history-panel">
-            <div className="history-title">对战统计</div>
-            <div className="history-summary">共进行 {roundHistory.length} 局</div>
-            <div className="history-summary">大比分：A {room?.seriesScore?.A ?? 0} - B {room?.seriesScore?.B ?? 0}</div>
-
-            {roundHistory.length === 0 && <div className="history-empty">暂无历史对局</div>}
-
-            {roundHistory
-              .slice()
-              .sort((a, b) => b.roundNumber - a.roundNumber)
-              .map((item) => {
-                const itemWinner = item.winner === 'draw' ? '平局' : item.winner ? `${item.winner} 胜` : '-';
-                return (
-                  <button
-                    key={item.roundNumber}
-                    type="button"
-                    className={`history-item ${selectedHistoryRound === item.roundNumber ? 'history-item-active' : ''}`}
-                    onClick={() => setSelectedHistoryRound(item.roundNumber)}
-                  >
-                    <div>第 {item.roundNumber} 局</div>
-                    <div>棋盘：{item.boardRows}*{item.boardCols}</div>
-                    <div>先手：{item.starter ?? '-'}</div>
-                    <div>结果：{itemWinner}</div>
-                    <div>
-                      比分：A {item.scores.A} - B {item.scores.B}
-                    </div>
+              {needsSpecAgreement && (
+                <p className="hint spec-lock-hint">
+                  <span>🔒 需先协商棋盘规格</span>
+                  <span>提议并经对方同意后才能准备开局</span>
+                </p>
+              )}
+              {room?.status === 'rolling' && (
+                <button
+                  type="button"
+                  onClick={rollDice}
+                  className={`dice-btn block-btn ${rollingDice ? 'dice-rolling' : ''}`}
+                  disabled={!canRollDice || rollingDice}
+                >
+                  {rollingDice ? '掷骰中...' : isTieAwaitingReroll ? '重新掷骰' : '掷骰决定先手'}
+                </button>
+              )}
+              {restartAvailable && (
+                <div className="restart-box">
+                  <div className="restart-title">
+                    {displayStatus === 'playing' ? '重开本局（需双方同意）' : '开启下一局（需双方同意）'}
+                  </div>
+                  <button type="button" onClick={voteNextRound} className={myVote ? 'secondary block-btn' : 'block-btn'}>
+                    {myVote
+                      ? '撤回我的同意'
+                      : displayStatus === 'playing'
+                        ? '我同意重开'
+                        : '我同意下一局'}
                   </button>
-                );
-              })}
+                  <div className="restart-status">
+                    <span className={`vote-pill ${voteA ? 'voted' : ''}`}>A {voteA ? '✓' : '—'}</span>
+                    <span className={`vote-pill ${voteB ? 'voted' : ''}`}>B {voteB ? '✓' : '—'}</span>
+                  </div>
+                </div>
+              )}
+              <button type="button" onClick={resetLocal} className="secondary block-btn">
+                退回首页
+              </button>
+            </div>
+            <div className="system-messages">
+              {systemMessages.map((m) => (
+                <p key={m.id} className="message">
+                  {m.text}
+                </p>
+              ))}
+            </div>
+          </section>
 
+          <section className="side-section history-section">
+            <div className="side-title">对战统计</div>
+            <div className="history-summary">
+              <span className="series-count">共 {roundHistory.length} 局</span>
+              <div className="series-score">
+                <span className="series-side series-a">A</span>
+                <span className="series-num">{room?.seriesScore?.A ?? 0}</span>
+                <span className="series-sep">:</span>
+                <span className="series-num">{room?.seriesScore?.B ?? 0}</span>
+                <span className="series-side series-b">B</span>
+              </div>
+            </div>
+            {roundHistory.length === 0 && <div className="history-empty">暂无历史对局</div>}
+            <div className="history-list">
+              {roundHistory
+                .slice()
+                .sort((a, b) => b.roundNumber - a.roundNumber)
+                .map((item) => {
+                  const itemWinner = item.winner === 'draw' ? '平局' : item.winner ? `${item.winner} 胜` : '-';
+                  return (
+                    <button
+                      key={item.roundNumber}
+                      type="button"
+                      className={`history-item ${selectedHistoryRound === item.roundNumber ? 'history-item-active' : ''}`}
+                      onClick={() => selectHistoryRound(item.roundNumber)}
+                    >
+                      <div className="history-item-head">
+                        第 {item.roundNumber} 局 · {item.boardRows}*{item.boardCols}
+                      </div>
+                      <div>
+                        先手 {item.starter ?? '-'} · 比分 A {item.scores.A} - B {item.scores.B} · {itemWinner}
+                      </div>
+                    </button>
+                  );
+                })}
+            </div>
             {viewingHistory && (
-              <button type="button" className="secondary" onClick={() => setSelectedHistoryRound(null)}>
+              <button type="button" className="secondary block-btn" onClick={() => selectHistoryRound(null)}>
                 返回当前对局
               </button>
             )}
@@ -850,66 +1231,90 @@ function App() {
         </aside>
 
         <main className="main-area">
-          <section className="panel status">
-            <div className="round-badge">第 {displayRoundNumber} 局</div>
-            <div className="status-grid">
-              <div>当前房间：{room?.roomId || '未进入'}</div>
-              <div>
-                棋盘规格：{rows}*{cols}
-              </div>
-              <div>你的身份：{playerSymbol || '-'}</div>
-              <div>回合：{turnDisplayText}</div>
-              <div>状态：{statusDisplayText}</div>
-              <div>先手：{starterDisplayText}</div>
-              <div>
-                结果：{resultDisplayText}
-              </div>
+          <section className="panel match-header">
+            <div className="match-meta-row">
+              <span className="round-badge">第 {displayRoundNumber} 局</span>
+              {room?.roomId ? (
+                <button type="button" className="meta-chip chip-copy" onClick={copyRoomId} title="点击复制房间链接">
+                  {copiedRoom ? '已复制 ✓' : `房间 ${room.roomId} ⧉`}
+                </button>
+              ) : (
+                <span className="meta-chip">房间 未进入</span>
+              )}
+              <span className="meta-chip">{rows}*{cols}</span>
+              <span className={`state-chip state-${displayStatus ?? 'idle'}`}>{statusDisplayText}</span>
+              <span className="meta-chip">{starterChipText}</span>
+              {(room?.spectators?.length ?? 0) > 0 && (
+                <span className="meta-chip">👁 旁观 {room?.spectators?.length} 人</span>
+              )}
             </div>
 
             <div className="score-row">
-              <div className="score-card score-a">
-                <div>A 方</div>
-                <div>{playerA?.name || '等待加入'}</div>
-                <div className="online-tag">{playerA?.connected === false ? '离线' : '在线'}</div>
-                <div className="ready-tag">{room?.readyBySymbol?.A ? '已准备' : '未准备'}</div>
-                {bothPlayersReady && (
-                  <div
-                    className={`dice-tag ${
-                      room?.status === 'rolling' && room?.diceRolls?.A === null ? 'dice-waiting' : ''
-                    }`}
-                  >
-                    🎲 {room?.diceRolls?.A ?? '-'}
-                  </div>
-                )}
+              <div className={`score-card score-a ${aActive ? 'score-active' : ''} ${playerSymbol === 'A' ? 'score-mine' : ''}`}>
+                <div className="score-top">
+                  <span className="score-side">A 方</span>
+                  {playerSymbol === 'A' && <span className="you-tag">你</span>}
+                  <span className="online-tag">{playerA?.connected === false ? '离线' : '在线'}</span>
+                  <span className="ready-tag">{room?.readyBySymbol?.A ? '已准备' : '未准备'}</span>
+                  {bothPlayersReady && (
+                    <span
+                      className={`dice-tag ${room?.status === 'rolling' && room?.diceRolls?.A === null ? 'dice-waiting' : ''}`}
+                    >
+                      🎲 {room?.diceRolls?.A ?? '-'}
+                    </span>
+                  )}
+                </div>
+                <div className="score-name">{playerA?.name || '等待加入'}</div>
+                <div className="score-bottom">
+                  {aActive && <span className="playing-tag">行动中</span>}
                   <strong>{displayScores.A}</strong>
+                </div>
               </div>
-              <div className="score-card score-b">
-                <div>B 方</div>
-                <div>{playerB?.name || '等待加入'}</div>
-                <div className="online-tag">{playerB?.connected === false ? '离线' : '在线'}</div>
-                <div className="ready-tag">{room?.readyBySymbol?.B ? '已准备' : '未准备'}</div>
-                {bothPlayersReady && (
-                  <div
-                    className={`dice-tag ${
-                      room?.status === 'rolling' && room?.diceRolls?.B === null ? 'dice-waiting' : ''
-                    }`}
-                  >
-                    🎲 {room?.diceRolls?.B ?? '-'}
-                  </div>
-                )}
+
+              <div className={`turn-medal turn-medal-${medalKind}`}>
+                <span className="medal-symbol">{medalSymbol}</span>
+                <span className="medal-label">{medalLabel}</span>
+              </div>
+
+              <div className={`score-card score-b ${bActive ? 'score-active' : ''} ${playerSymbol === 'B' ? 'score-mine' : ''}`}>
+                <div className="score-top">
+                  <span className="score-side">B 方</span>
+                  {playerSymbol === 'B' && <span className="you-tag">你</span>}
+                  <span className="online-tag">{playerB?.connected === false ? '离线' : '在线'}</span>
+                  <span className="ready-tag">{room?.readyBySymbol?.B ? '已准备' : '未准备'}</span>
+                  {bothPlayersReady && (
+                    <span
+                      className={`dice-tag ${room?.status === 'rolling' && room?.diceRolls?.B === null ? 'dice-waiting' : ''}`}
+                    >
+                      🎲 {room?.diceRolls?.B ?? '-'}
+                    </span>
+                  )}
+                </div>
+                <div className="score-name">{playerB?.name || '等待加入'}</div>
+                <div className="score-bottom">
+                  {bActive && <span className="playing-tag">行动中</span>}
                   <strong>{displayScores.B}</strong>
+                </div>
               </div>
+            </div>
+
+            <div className={`turn-banner banner-${bannerKind}`}>
+              <span>{bannerText}</span>
             </div>
           </section>
 
-          <section ref={boardWrapRef} className={`panel board-wrap ${canMakeMove ? 'my-turn' : ''}`}>
+          <section
+            className={`panel board-wrap ${
+              canMakeMove ? (playerSymbol === 'A' ? 'glow-a' : 'glow-b') : ''
+            }`}
+          >
             <div className="board">
               {Array.from({ length: rows + 1 }).map((_, r) => (
                 <div key={`row-group-${r}`}>
                   <div className="line-row" style={{ gridTemplateColumns: `repeat(${cols}, var(--dot-size) var(--edge-span)) var(--dot-size)` }}>
                     {Array.from({ length: cols }).flatMap((__, c) => {
                       const hEdge = edgeId('h', r, c);
-                      const hOwner = displayClaimedEdges[hEdge];
+                      const hOwner = shownEdges[hEdge];
                       return [
                         <span key={`${hEdge}-dot`} className="dot" />,
                         <button
@@ -930,8 +1335,8 @@ function App() {
                       {Array.from({ length: cols }).flatMap((__, c) => {
                         const leftEdge = edgeId('v', r, c);
                         const boxKey = `${r}-${c}`;
-                        const boxOwner = displayClaimedBoxes[boxKey];
-                        const edgeOwner = displayClaimedEdges[leftEdge];
+                        const boxOwner = shownBoxes[boxKey];
+                        const edgeOwner = shownEdges[leftEdge];
                         return [
                           <button
                             key={leftEdge}
@@ -949,7 +1354,7 @@ function App() {
 
                       {(() => {
                         const rightEdge = edgeId('v', r, cols);
-                        const rightOwner = displayClaimedEdges[rightEdge];
+                        const rightOwner = shownEdges[rightEdge];
                         return (
                           <button
                             type="button"
@@ -966,59 +1371,151 @@ function App() {
               ))}
             </div>
 
-            {displayStatus === 'finished' && showWinnerPanel && (
-              <div
-                className={`winner-panel ${
-                  displayWinner === 'A' ? 'winner-a' : displayWinner === 'B' ? 'winner-b' : 'winner-draw'
-                }`}
-              >
-                <div className="winner-kicker">对局结束</div>
-                <div className="winner-title">{winnerDisplayText}</div>
-                <div className="winner-sub">{winnerName ? `获胜玩家：${winnerName}` : '双方势均力敌'}</div>
-                <div className="winner-sub">
-                  最终比分：A {displayScores.A} - B {displayScores.B}
+            {viewingHistory && totalMoves > 0 && (
+              <div className="replay-bar">
+                <span className="replay-label">回放</span>
+                <button type="button" onClick={() => setReplayStep(0)} title="回到开局">⏮</button>
+                <button
+                  type="button"
+                  onClick={() => setReplayStep(Math.max(0, (replayStep ?? totalMoves) - 1))}
+                >
+                  ◀
+                </button>
+                <button type="button" onClick={() => setReplayAuto((v) => !v)}>
+                  {replayAuto ? '⏸ 暂停' : '▶ 自动'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setReplayStep(Math.min(totalMoves, (replayStep ?? 0) + 1))}
+                >
+                  ▶
+                </button>
+                <button type="button" onClick={() => setReplayStep(totalMoves)} title="跳到终局">⏭</button>
+                <span className="replay-pos">
+                  {replayStep === null ? `终局 ${totalMoves}/${totalMoves}` : `${replayStep}/${totalMoves}`}
+                </span>
+                {replayStep !== null && (
+                  <button type="button" className="secondary" onClick={() => setReplayStep(null)}>
+                    回到终局
+                  </button>
+                )}
+              </div>
+            )}
+
+            {room && displayStatus === 'waiting' && room.specAgreed === false && (
+              <div className="board-overlay overlay-locked">
+                <div className="overlay-card">
+                  <div className="lock-icon">🔒</div>
+                  <div className="overlay-title">棋盘规格待确认</div>
+                  <div className="overlay-sub">
+                    {pendingProposalForMe
+                      ? pendingProposalForMe.by === playerSymbol
+                        ? `已提议 ${pendingProposalForMe.rows}*${pendingProposalForMe.cols}，等待对方在聊天中同意…`
+                        : `对方已提议 ${pendingProposalForMe.rows}*${pendingProposalForMe.cols}，请在聊天中回应`
+                      : room.specAgreedOnce
+                        ? `上一局规格 ${rows}*${cols}：可一键沿用，也可在左侧提议新规格`
+                        : `当前预览 ${rows}*${cols}：由任一方在左侧“提议规格”，对方同意后解锁开局`}
+                  </div>
+                  {room.specAgreedOnce && !pendingProposalForMe && (
+                    <button type="button" className="overlay-vote-btn" onClick={confirmSpec}>
+                      沿用上一局 {rows}*{cols}
+                    </button>
+                  )}
                 </div>
               </div>
             )}
 
             {displayStatus === 'finished' && !viewingHistory && (
-              <button type="button" className="next-round-btn" onClick={startNextRound}>
-                再来一局
-              </button>
+              <div
+                className={`board-overlay overlay-${
+                  displayWinner === 'A' ? 'a' : displayWinner === 'B' ? 'b' : 'draw'
+                }`}
+              >
+                <div className="overlay-card">
+                  <div className="overlay-kicker">第 {displayRoundNumber} 局结束</div>
+                  <div className="overlay-title">{winnerDisplayText}</div>
+                  <div className="overlay-sub">
+                    {winnerName ? `获胜玩家：${winnerName}` : '双方势均力敌'} · 最终比分 A {displayScores.A} - B{' '}
+                    {displayScores.B}
+                  </div>
+                  <div className="overlay-vote">
+                    <button
+                      type="button"
+                      className={myVote ? 'overlay-vote-btn voted-cancel' : 'overlay-vote-btn'}
+                      onClick={voteNextRound}
+                    >
+                      {myVote ? '已同意，点击撤回' : '同意再来一局'}
+                    </button>
+                    <div className="restart-status">
+                      <span className={`vote-pill ${voteA ? 'voted' : ''}`}>A {voteA ? '✓' : '—'}</span>
+                      <span className={`vote-pill ${voteB ? 'voted' : ''}`}>B {voteB ? '✓' : '—'}</span>
+                    </div>
+                    <p className="overlay-hint">需双方都同意才开启下一局；历史与大比分保留。</p>
+                  </div>
+                </div>
+              </div>
             )}
           </section>
 
-          <section className="panel chat-panel">
-            <h3>房间聊天</h3>
-            <div className="chat-list">
-              {chatMessages.length === 0 && <div className="chat-empty">还没有消息，打个招呼吧。</div>}
-              {chatMessages.map((item, idx) => (
-                <div key={`${item.timestamp}-${idx}`} className={`chat-item chat-${item.senderSymbol.toLowerCase()}`}>
-                  <span className="chat-author">
-                    {item.senderSymbol} {item.senderName}
-                  </span>
-                  <span className="chat-text">{item.message}</span>
-                </div>
-              ))}
-            </div>
-            <div className="chat-input-row">
-              <input
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    sendChat();
-                  }
-                }}
-                placeholder="输入聊天内容，回车发送"
-                maxLength={200}
-              />
-              <button type="button" onClick={sendChat}>
-                发送
-              </button>
-            </div>
-          </section>
         </main>
+
+        <aside className="panel chat-panel">
+          <div className="chat-head">
+            <h3>房间聊天</h3>
+            {chatMessages.length > 0 && (
+              <button
+                type="button"
+                className="chat-clear"
+                onClick={clearChat}
+                title="清空聊天记录（保留待回应的规格提议）"
+              >
+                🗑
+              </button>
+            )}
+          </div>
+          <div ref={chatListRef} className="chat-list">
+            {chatMessages.length === 0 && <div className="chat-empty"></div>}
+            {chatMessages.map((item, idx) => (
+              <div key={`${item.timestamp}-${idx}`} className={`chat-item chat-${item.senderSymbol.toLowerCase()}`}>
+                <span className="chat-author">
+                  {item.senderSymbol} {item.senderName}
+                </span>
+                {renderChatBody(item)}
+              </div>
+            ))}
+          </div>
+          <div className="chat-input-row">
+            <textarea
+              ref={chatInputRef}
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key !== 'Enter') {
+                  return;
+                }
+                // 输入法组词时的回车只确认候选词，不发送也不换行
+                if (e.nativeEvent.isComposing) {
+                  return;
+                }
+                e.preventDefault();
+                if (e.shiftKey || e.ctrlKey || e.altKey) {
+                  insertNewlineAtCaret();
+                  return;
+                }
+                sendChat();
+              }}
+              placeholder={isSpectator ? '旁观者只读，不能发言' : ''}
+              maxLength={200}
+              rows={1}
+              disabled={isSpectator}
+            />
+            <button type="button" onClick={sendChat} disabled={isSpectator} aria-label="发送" title="发送 (Enter)">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true">
+                <path d="M3.4 20.4l17.45-7.48a1 1 0 0 0 0-1.84L3.4 3.6a.993.993 0 0 0-1.39.91L2 9.12c0 .5.37.93.87.99L17 12 2.87 13.88c-.5.07-.87.5-.87 1l.01 4.61c0 .71.73 1.2 1.39.91z" />
+              </svg>
+            </button>
+          </div>
+        </aside>
       </div>
 
       {starterModal.show && (
@@ -1028,6 +1525,29 @@ function App() {
             <div className="starter-modal-text">{starterModal.text}</div>
             <button type="button" onClick={() => setStarterModal({ show: false, text: '' })}>
               开始对局
+            </button>
+          </div>
+        </div>
+      )}
+
+      {rulesOpen && (
+        <div className="modal-backdrop" onClick={() => setRulesOpen(false)}>
+          <div className="rules-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="rules-modal-title">游戏规则</div>
+            <div className="rules-list">
+              {GAME_RULES.map((section) => (
+                <div key={section.title} className="rules-section">
+                  <div className="rules-section-title">{section.title}</div>
+                  <ul>
+                    {section.items.map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+            <button type="button" onClick={() => setRulesOpen(false)}>
+              知道了
             </button>
           </div>
         </div>

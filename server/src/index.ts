@@ -11,8 +11,11 @@ type Player = {
   name: string;
   symbol: PlayerSymbol;
   token: string;
+  nonce?: string;
   connected: boolean;
 };
+
+type Spectator = { id: string; name: string };
 
 type RoundHistoryItem = {
   roundNumber: number;
@@ -23,6 +26,7 @@ type RoundHistoryItem = {
   scores: Record<PlayerSymbol, number>;
   finalClaimedEdges: Record<string, PlayerSymbol>;
   finalClaimedBoxes: Record<string, PlayerSymbol>;
+  moveOrder: string[];
   finishedAt: number;
 };
 
@@ -32,6 +36,20 @@ type RoomChatMessage = {
   senderName: string;
   message: string;
   timestamp: number;
+  kind?: 'text' | 'board-proposal';
+  proposal?: {
+    id: number;
+    rows: number;
+    cols: number;
+    status: 'pending' | 'accepted' | 'rejected';
+  };
+};
+
+type BoardProposal = {
+  id: number;
+  rows: number;
+  cols: number;
+  by: PlayerSymbol;
 };
 
 type RoomState = {
@@ -50,6 +68,12 @@ type RoomState = {
   seriesScore: Record<PlayerSymbol, number>;
   roundHistory: RoundHistoryItem[];
   chatHistory: RoomChatMessage[];
+  nextRoundVotes: Record<PlayerSymbol, boolean>;
+  boardProposal: BoardProposal | null;
+  spectators: Spectator[];
+  moveOrder: string[];
+  specAgreed: boolean;
+  specAgreedOnce: boolean;
   status: 'waiting' | 'rolling' | 'playing' | 'finished';
   winner: PlayerSymbol | 'draw' | null;
 };
@@ -66,12 +90,14 @@ type JoinRoomPayload = {
   roomId: string;
   playerName: string;
   playerToken?: string;
+  nonce?: string;
 };
 
 type RejoinRoomPayload = {
   roomId: string;
   playerName?: string;
   playerToken: string;
+  nonce?: string;
 };
 
 type MakeMovePayload = {
@@ -93,13 +119,34 @@ type RollDicePayload = {
   roomId: string;
 };
 
-type StartNextRoundPayload = {
+type VoteNextRoundPayload = {
+  roomId: string;
+};
+
+type ProposeBoardPayload = {
+  roomId: string;
+  rows: number;
+  cols: number;
+};
+
+type RespondBoardPayload = {
+  roomId: string;
+  proposalId: number;
+  accept: boolean;
+};
+
+type ConfirmSpecPayload = {
+  roomId: string;
+};
+
+type ClearChatPayload = {
   roomId: string;
 };
 
 type PresencePingPayload = {
   roomId: string;
   playerToken: string;
+  nonce?: string;
 };
 
 const MIN_SIZE = 2;
@@ -245,6 +292,7 @@ function recordFinishedRound(room: RoomState): void {
     scores: { ...room.scores },
     finalClaimedEdges: { ...room.claimedEdges },
     finalClaimedBoxes: { ...room.claimedBoxes },
+    moveOrder: [...room.moveOrder],
     finishedAt: Date.now(),
   });
 
@@ -259,10 +307,29 @@ function resetRoundState(room: RoomState): void {
   room.scores = { A: 0, B: 0 };
   room.readyBySymbol = { A: false, B: false };
   room.diceRolls = { A: null, B: null };
+  room.nextRoundVotes = { A: false, B: false };
+  room.boardProposal = null;
+  room.moveOrder = [];
+  // 每局开局前都重新确认规格（沿用或新提议），specAgreedOnce 记录是否曾确认过
+  room.specAgreed = false;
   room.starter = null;
   room.currentTurn = 'A';
   room.winner = null;
   room.status = 'waiting';
+}
+
+// 进入掷骰/对局阶段后，未回应的棋盘提议自动作废
+function invalidatePendingProposal(room: RoomState): void {
+  if (!room.boardProposal) {
+    return;
+  }
+
+  room.chatHistory.forEach((msg) => {
+    if (msg.kind === 'board-proposal' && msg.proposal?.status === 'pending') {
+      msg.proposal.status = 'rejected';
+    }
+  });
+  room.boardProposal = null;
 }
 
 function updateWinner(room: RoomState): void {
@@ -360,6 +427,12 @@ io.on('connection', (socket) => {
       seriesScore: { A: 0, B: 0 },
       roundHistory: [],
       chatHistory: [],
+      nextRoundVotes: { A: false, B: false },
+      boardProposal: null,
+      spectators: [],
+      moveOrder: [],
+      specAgreed: false,
+      specAgreedOnce: false,
       status: 'waiting',
       winner: null,
     };
@@ -387,6 +460,7 @@ io.on('connection', (socket) => {
       existingByToken.id = socket.id;
       existingByToken.connected = true;
       existingByToken.name = payload.playerName || existingByToken.name;
+      existingByToken.nonce = payload.nonce ?? existingByToken.nonce;
       socketRoomById.set(socket.id, room.roomId);
       socket.join(room.roomId);
       reconcileRoomStatus(room);
@@ -401,7 +475,20 @@ io.on('connection', (socket) => {
     }
 
     if (room.players.length >= 2) {
-      callback?.({ ok: false, message: '房间已满' });
+      // 满员：以旁观者身份进入（只读棋盘与聊天，不能落子/投票/发言）
+      const name = (payload.playerName || '旁观者').slice(0, 20);
+      room.spectators.push({ id: socket.id, name });
+      socketRoomById.set(socket.id, room.roomId);
+      socket.join(room.roomId);
+      callback?.({ ok: true, roomId: room.roomId, spectator: true });
+      emitRoomState(room.roomId);
+      return;
+    }
+
+    // 新玩家加入：拒绝与房间内玩家重名的昵称，避免聊天与身份混淆
+    const joinName = (payload.playerName || '').trim().toLowerCase();
+    if (joinName && room.players.some((p) => p.name.trim().toLowerCase() === joinName)) {
+      callback?.({ ok: false, message: '该昵称已被房间内玩家使用，请换一个昵称' });
       return;
     }
 
@@ -422,8 +509,11 @@ io.on('connection', (socket) => {
         name: payload.playerName || 'Player B',
         symbol: 'B',
         token: playerToken,
+        nonce: payload.nonce,
         connected: true,
       });
+    } else {
+      existing.nonce = payload.nonce;
     }
 
     room.readyBySymbol.B = false;
@@ -453,6 +543,9 @@ io.on('connection', (socket) => {
     clearRemovalTimer(room.roomId, player.token);
     player.id = socket.id;
     player.connected = true;
+    if (payload.nonce) {
+      player.nonce = payload.nonce;
+    }
     if (payload.playerName?.trim()) {
       player.name = payload.playerName.trim();
     }
@@ -478,10 +571,20 @@ io.on('connection', (socket) => {
       return;
     }
 
+    // 开局门槛：棋盘规格必须经双方协商同意后才能准备（首局强制协商一次，之后沿用可再改）
+    if (payload.ready && !room.specAgreed) {
+      callback?.({ ok: false, message: '开局前需先协商棋盘规格：任一方提议并经对方同意后才能开始' });
+      return;
+    }
+
     room.readyBySymbol[symbol] = Boolean(payload.ready);
     if (Object.keys(room.claimedEdges).length === 0) {
       room.starter = null;
       room.diceRolls = { A: null, B: null };
+    }
+
+    if (room.readyBySymbol.A && room.readyBySymbol.B) {
+      invalidatePendingProposal(room);
     }
 
     reconcileRoomStatus(room);
@@ -509,7 +612,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Tie re-roll: keep previous values visible until any player initiates next round.
+    // 兼容旧版本遗留的同点僵局：新逻辑不会再产生这种状态，但热更新前的房间可能停在这里
     if (
       room.starter === null &&
       typeof room.diceRolls.A === 'number' &&
@@ -526,24 +629,26 @@ io.on('connection', (socket) => {
 
     room.diceRolls[symbol] = randomInt(1, 7);
 
-    const a = room.diceRolls.A;
-    const b = room.diceRolls.B;
+    let a = room.diceRolls.A;
+    let b = room.diceRolls.B;
+    let rerollTimes = 0;
+    // 双方同点时由服务端自动重掷双方，直到分出先后；100 次上限仅为防御性保底（同点概率每次 1/6）
+    while (typeof a === 'number' && typeof b === 'number' && a === b && rerollTimes < 100) {
+      room.diceRolls = { A: randomInt(1, 7), B: randomInt(1, 7) };
+      a = room.diceRolls.A;
+      b = room.diceRolls.B;
+      rerollTimes += 1;
+    }
+
     if (typeof a === 'number' && typeof b === 'number') {
-      if (a === b) {
-        room.starter = null;
-        io.to(room.roomId).emit('dice_tie', {
-          message: `骰子点数相同（A:${a}, B:${b}），请重新掷骰`,
-          diceRolls: room.diceRolls,
-        });
-      } else {
-        room.starter = a > b ? 'A' : 'B';
-        room.currentTurn = room.starter;
-        io.to(room.roomId).emit('dice_decided', {
-          starter: room.starter,
-          diceRolls: room.diceRolls,
-          message: `${room.starter} 方先手`,
-        });
-      }
+      room.starter = a > b ? 'A' : 'B';
+      room.currentTurn = room.starter;
+      const tieNote = rerollTimes > 0 ? `（双方同点 ${a}，已自动重掷 ${rerollTimes} 次）` : '';
+      io.to(room.roomId).emit('dice_decided', {
+        starter: room.starter,
+        diceRolls: room.diceRolls,
+        message: `${room.starter} 方先手${tieNote}`,
+      });
     }
 
     reconcileRoomStatus(room);
@@ -551,15 +656,10 @@ io.on('connection', (socket) => {
     emitRoomState(room.roomId);
   });
 
-  socket.on('start_next_round', (payload: StartNextRoundPayload, callback?: (response: unknown) => void) => {
+  socket.on('vote_next_round', (payload: VoteNextRoundPayload, callback?: (response: unknown) => void) => {
     const room = rooms.get(payload.roomId);
     if (!room) {
       callback?.({ ok: false, message: '房间不存在' });
-      return;
-    }
-
-    if (room.status !== 'finished') {
-      callback?.({ ok: false, message: '当前对局尚未结束' });
       return;
     }
 
@@ -569,9 +669,37 @@ io.on('connection', (socket) => {
       return;
     }
 
-    room.roundNumber += 1;
-    resetRoundState(room);
-    callback?.({ ok: true, roundNumber: room.roundNumber });
+    if (room.status !== 'playing' && room.status !== 'finished') {
+      callback?.({ ok: false, message: '当前阶段不能发起重开投票' });
+      return;
+    }
+
+    // Toggle own vote so the same action doubles as "agree" and "take back agreement".
+    const wasFinished = room.status === 'finished';
+    if (!wasFinished && hasRoundBeenRecorded(room)) {
+      callback?.({ ok: false, message: '当前局面状态异常，无法重开' });
+      return;
+    }
+    room.nextRoundVotes[symbol] = !room.nextRoundVotes[symbol];
+
+    let resetMessage: string | null = null;
+    if (room.nextRoundVotes.A && room.nextRoundVotes.B) {
+      if (wasFinished) {
+        room.roundNumber += 1;
+        resetMessage = '双方一致同意，已开启新一局，历史战绩保留。';
+      } else {
+        // Aborting an unfinished round leaves history/series score untouched.
+        resetMessage = `双方一致同意，第 ${room.roundNumber} 局已重新开始。`;
+      }
+      resetRoundState(room);
+      io.to(room.roomId).emit('round_reset', { message: resetMessage });
+    }
+
+    callback?.({
+      ok: true,
+      votes: { ...room.nextRoundVotes },
+      voted: room.nextRoundVotes[symbol],
+    });
     emitRoomState(room.roomId);
   });
 
@@ -592,7 +720,10 @@ io.on('connection', (socket) => {
       changed = true;
     }
 
-    if (player.id !== socket.id) {
+    // nonce 校验：同一页面断线重连（nonce 相同）可重新绑定；
+    // 不同页面的 ping 不能抢走已活跃会话，避免双开同令牌时互相干扰
+    const samePage = payload.nonce !== undefined && player.nonce === payload.nonce;
+    if (player.id !== socket.id && (samePage || !player.connected || player.id.startsWith('offline-'))) {
       player.id = socket.id;
       changed = true;
     }
@@ -617,7 +748,11 @@ io.on('connection', (socket) => {
     const symbol = getPlayerSymbol(room, socket.id);
     const player = room.players.find((p) => p.id === socket.id);
     if (!symbol || !player) {
-      callback?.({ ok: false, message: '你不在当前房间中' });
+      if (room.spectators.some((sp) => sp.id === socket.id)) {
+        callback?.({ ok: false, message: '旁观者不能发送消息' });
+      } else {
+        callback?.({ ok: false, message: '你不在当前房间中' });
+      }
       return;
     }
 
@@ -644,6 +779,178 @@ io.on('connection', (socket) => {
     emitRoomState(room.roomId);
 
     callback?.({ ok: true });
+  });
+
+  socket.on('propose_board', (payload: ProposeBoardPayload, callback?: (response: unknown) => void) => {
+    const room = rooms.get(payload.roomId);
+    if (!room) {
+      callback?.({ ok: false, message: '房间不存在' });
+      return;
+    }
+
+    const symbol = getPlayerSymbol(room, socket.id);
+    const player = getPlayerBySocket(room, socket.id);
+    if (!symbol || !player) {
+      callback?.({ ok: false, message: '你不在当前房间中' });
+      return;
+    }
+
+    if (room.status !== 'waiting') {
+      callback?.({ ok: false, message: '只能在开局前的准备阶段提议棋盘规格' });
+      return;
+    }
+
+    const rows = payload.rows;
+    const cols = payload.cols;
+    if (
+      !Number.isInteger(rows) ||
+      !Number.isInteger(cols) ||
+      rows < MIN_SIZE ||
+      rows > MAX_SIZE ||
+      cols < MIN_SIZE ||
+      cols > MAX_SIZE
+    ) {
+      callback?.({ ok: false, message: '棋盘规格须为 2 到 8 的整数，例如 5*4' });
+      return;
+    }
+
+    // 新提议取代旧的未回应提议（也支持对方直接还价）
+    invalidatePendingProposal(room);
+
+    const proposalId = Date.now();
+    const chatMessage: RoomChatMessage = {
+      roomId: room.roomId,
+      senderSymbol: symbol,
+      senderName: player.name,
+      message: `提议棋盘规格 ${rows}*${cols}`,
+      timestamp: proposalId,
+      kind: 'board-proposal',
+      proposal: { id: proposalId, rows, cols, status: 'pending' },
+    };
+    room.boardProposal = { id: proposalId, rows, cols, by: symbol };
+    room.chatHistory.push(chatMessage);
+    if (room.chatHistory.length > MAX_CHAT_HISTORY) {
+      room.chatHistory = room.chatHistory.slice(-MAX_CHAT_HISTORY);
+    }
+
+    io.to(room.roomId).emit('chat_message', chatMessage);
+    emitRoomState(room.roomId);
+    callback?.({ ok: true });
+  });
+
+  socket.on('respond_board', (payload: RespondBoardPayload, callback?: (response: unknown) => void) => {
+    const room = rooms.get(payload.roomId);
+    if (!room) {
+      callback?.({ ok: false, message: '房间不存在' });
+      return;
+    }
+
+    const symbol = getPlayerSymbol(room, socket.id);
+    if (!symbol) {
+      callback?.({ ok: false, message: '你不在当前房间中' });
+      return;
+    }
+
+    const proposal = room.boardProposal;
+    if (!proposal || proposal.id !== payload.proposalId) {
+      callback?.({ ok: false, message: '该提议已失效' });
+      return;
+    }
+
+    if (proposal.by === symbol) {
+      callback?.({ ok: false, message: '不能回应自己的提议' });
+      return;
+    }
+
+    if (room.status !== 'waiting') {
+      callback?.({ ok: false, message: '当前阶段无法处理该提议' });
+      return;
+    }
+
+    const entry = room.chatHistory.find(
+      (msg) => msg.kind === 'board-proposal' && msg.proposal?.id === payload.proposalId,
+    );
+
+    if (payload.accept) {
+      room.boardRows = sanitizeSize(proposal.rows);
+      room.boardCols = sanitizeSize(proposal.cols);
+      if (entry?.proposal) {
+        entry.proposal.status = 'accepted';
+      }
+      resetRoundState(room);
+      // 重置完成后再解锁：本局以新确认的规格开局（每局开局前都会重新锁定，见 resetRoundState）
+      room.specAgreed = true;
+      room.specAgreedOnce = true;
+      io.to(room.roomId).emit('board_proposal_result', {
+        proposalId: payload.proposalId,
+        accepted: true,
+        message: `双方同意，棋盘规格改为 ${room.boardRows}*${room.boardCols}，请重新准备`,
+      });
+    } else {
+      if (entry?.proposal) {
+        entry.proposal.status = 'rejected';
+      }
+      room.boardProposal = null;
+      io.to(room.roomId).emit('board_proposal_result', {
+        proposalId: payload.proposalId,
+        accepted: false,
+        message: `${symbol} 方拒绝了 ${proposal.rows}*${proposal.cols} 的提议`,
+      });
+    }
+
+    callback?.({ ok: true });
+    emitRoomState(room.roomId);
+  });
+
+  socket.on('confirm_spec', (payload: ConfirmSpecPayload, callback?: (response: unknown) => void) => {
+    const room = rooms.get(payload.roomId);
+    if (!room) {
+      callback?.({ ok: false, message: '房间不存在' });
+      return;
+    }
+
+    const symbol = getPlayerSymbol(room, socket.id);
+    if (!symbol) {
+      callback?.({ ok: false, message: '你不在当前房间中' });
+      return;
+    }
+
+    if (room.status !== 'waiting') {
+      callback?.({ ok: false, message: '当前阶段无法确认规格' });
+      return;
+    }
+
+    // “沿用上一局规格”一键确认：仅当此前协商确认过时可用（首局必须走提议协商）
+    if (!room.specAgreedOnce) {
+      callback?.({ ok: false, message: '尚无已确认的规格，请先提议并经对方同意' });
+      return;
+    }
+
+    room.specAgreed = true;
+    callback?.({ ok: true, rows: room.boardRows, cols: room.boardCols });
+    emitRoomState(room.roomId);
+  });
+
+  socket.on('clear_chat', (payload: ClearChatPayload, callback?: (response: unknown) => void) => {
+    const room = rooms.get(payload.roomId);
+    if (!room) {
+      callback?.({ ok: false, message: '房间不存在' });
+      return;
+    }
+
+    const symbol = getPlayerSymbol(room, socket.id);
+    if (!symbol) {
+      callback?.({ ok: false, message: room.spectators.some((sp) => sp.id === socket.id) ? '旁观者不能清空聊天' : '你不在当前房间中' });
+      return;
+    }
+
+    // 仅清空普通消息；未处理的棋盘提议必须保留，等待对方回应
+    room.chatHistory = room.chatHistory.filter(
+      (msg) => msg.kind === 'board-proposal' && msg.proposal?.status === 'pending',
+    );
+
+    callback?.({ ok: true, kept: room.chatHistory.length });
+    emitRoomState(room.roomId);
   });
 
   socket.on('make_move', (payload: MakeMovePayload, callback?: (response: unknown) => void) => {
@@ -681,6 +988,7 @@ io.on('connection', (socket) => {
     }
 
     room.claimedEdges[payload.edgeId] = symbol;
+    room.moveOrder.push(payload.edgeId);
     const completedBoxes = findCompletedBoxes(room, symbol);
     if (completedBoxes === 0) {
       room.currentTurn = symbol === 'A' ? 'B' : 'A';
@@ -705,11 +1013,17 @@ io.on('connection', (socket) => {
 
     const player = getPlayerBySocket(room, socket.id);
     if (!player) {
+      const specIdx = room.spectators.findIndex((sp) => sp.id === socket.id);
+      if (specIdx >= 0) {
+        room.spectators.splice(specIdx, 1);
+        emitRoomState(roomId);
+      }
       return;
     }
 
     player.connected = false;
     player.id = `offline-${player.symbol}-${Date.now()}`;
+    room.nextRoundVotes[player.symbol] = false;
     reconcileRoomStatus(room);
     io.to(roomId).emit('player_left', { message: `${player.name} 暂时离线，等待重连...` });
     emitRoomState(roomId);
