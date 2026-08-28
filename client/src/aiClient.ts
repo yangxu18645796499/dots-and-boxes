@@ -171,8 +171,14 @@ export async function requestAiMove(
   serverUrl: string,
 ): Promise<string> {
   const controller = new AbortController();
-  // 思考型模型推理较慢，超时放宽到 60s
-  const timer = window.setTimeout(() => controller.abort(), 60_000);
+  // 按模型分级超时：Qwen 走中转时已关闭思考（60s）；reasoner/r1 等思考型模型给足推理时间（150s）
+  const isThinkingModel = /reasoner|r1|thinking|deepseek/i.test(config.model);
+  const timeoutMs = /qwen/i.test(config.model)
+    ? 60_000
+    : isThinkingModel
+      ? 150_000
+      : 90_000;
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
     const content: Array<{ type: string; text?: string; image_url?: { url: string } }> = [
       { type: 'text', text: prompt },
