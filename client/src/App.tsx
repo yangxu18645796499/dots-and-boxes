@@ -756,24 +756,49 @@ function App() {
     setReplayStep(null);
   }
 
+  function fallbackCopyText(text: string, onDone: () => void): void {
+    // http 局域网等非安全上下文没有 navigator.clipboard：临时 textarea + execCommand 兜底
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch {
+      ok = false;
+    }
+    document.body.removeChild(ta);
+    if (ok) {
+      onDone();
+    } else {
+      pushSystemMessage('复制失败，请手动记录房间号。');
+    }
+  }
+
   function copyRoomId(): void {
     const id = room?.roomId;
     if (!id) {
       return;
     }
 
-    if (!navigator.clipboard) {
-      pushSystemMessage('当前环境不支持复制，请手动记录房间号。');
+    const done = () => {
+      setCopiedRoom(true);
+      window.setTimeout(() => setCopiedRoom(false), 1600);
+    };
+
+    // 复制纯房间号：局域网 http 环境对方直接在房号输入即可，最通用
+    if (navigator.clipboard) {
+      navigator.clipboard
+        .writeText(id)
+        .then(done)
+        .catch(() => fallbackCopyText(id, done));
       return;
     }
 
-    navigator.clipboard
-      .writeText(`${window.location.origin}${window.location.pathname}?room=${id}`)
-      .then(() => {
-        setCopiedRoom(true);
-        window.setTimeout(() => setCopiedRoom(false), 1600);
-      })
-      .catch(() => pushSystemMessage('复制失败，请手动记录房间号。'));
+    fallbackCopyText(id, done);
   }
 
   function createRoom(): void {
@@ -1371,7 +1396,6 @@ function App() {
                   {aiActive && (
                     <p className="hint ai-status">
                       🤖 AI {aiThinking ? '思考中…' : '待机'}
-                      {aiErrors > 0 ? ` · 出错 ${aiErrors} 次` : ''}
                     </p>
                   )}
                 </>
@@ -1435,7 +1459,7 @@ function App() {
             <div className="match-meta-row">
               <span className="round-badge">第 {displayRoundNumber} 局</span>
               {room?.roomId ? (
-                <button type="button" className="meta-chip chip-copy" onClick={copyRoomId} title="点击复制房间链接">
+                <button type="button" className="meta-chip chip-copy" onClick={copyRoomId} title="点击复制房间号">
                   {copiedRoom ? '已复制 ✓' : `房间 ${room.roomId} ⧉`}
                 </button>
               ) : (
