@@ -80,9 +80,8 @@
 - client/ 前端（含回归脚本与联调机器人）
 - server/ 实时联机服务端
 - docs/TECH_STACK_AND_PLAN.md 现行技术栈与架构基线
-- docs/optimization/ 第 1/2 轮迭代记录（op1、op2 索引及主题分册）
+- docs/optimization/ 第 1 轮迭代记录（op1.md 总索引 + op1-01~op1-04 主题分册）
 
 ## 文档索引
 - [docs/TECH_STACK_AND_PLAN.md](docs/TECH_STACK_AND_PLAN.md) — 现行架构与机制基线
-- [docs/optimization/op1.md](docs/optimization/op1.md) — 第 1 轮反馈记录
-- [docs/optimization/op2.md](docs/optimization/op2.md) — 第 2 轮反馈索引（UI / 对局机制 / 联机身份 / AI 四个分册）
+- [docs/optimization/op1.md](docs/optimization/op1.md) — 第 1 轮迭代总索引（原始反馈 + 主题分册 + 改进建议）
