@@ -2,6 +2,16 @@
 import { io, type Socket } from 'socket.io-client';
 import { create } from 'zustand';
 import { GAME_RULES } from './gameRules';
+import {
+  allEdges,
+  buildPrompt,
+  drawBoardImage,
+  loadAiConfig,
+  parseEdgeReply,
+  requestAiMove,
+  saveAiConfig,
+  type AiConfig,
+} from './aiClient';
 import './App.css';
 
 export type PlayerSymbol = 'A' | 'B';
@@ -230,6 +240,8 @@ function App() {
   const socketRef = useRef<Socket | null>(null);
   const chatListRef = useRef<HTMLDivElement | null>(null);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const aiBusyRef = useRef(false);
+  const aiErrorsRef = useRef(0);
   const [playerName, setPlayerName] = useState(INITIAL_SESSION?.playerName ?? readIdentity()?.name ?? '');
   const [roomIdInput, setRoomIdInput] = useState(() => {
     // 支持 ?room=XXXX / ?ROOM=xxxx 分享链接：URL 参数优先于本地会话
@@ -249,6 +261,12 @@ function App() {
   const [replayAuto, setReplayAuto] = useState(false);
   const [copiedRoom, setCopiedRoom] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);
+  const [aiConfig, setAiConfig] = useState<AiConfig>(() => loadAiConfig());
+  const [aiDraft, setAiDraft] = useState<AiConfig>(() => loadAiConfig());
+  const [aiModal, setAiModal] = useState(false);
+  const [aiActiveRoom, setAiActiveRoom] = useState<string | null>(null);
+  const [aiThinking, setAiThinking] = useState(false);
+  const [aiErrors, setAiErrors] = useState(0);
 
   const room = useGameStore((s) => s.room);
   const playerSymbol = useGameStore((s) => s.playerSymbol);
@@ -396,6 +414,10 @@ function App() {
   const bothPlayersReady = Boolean(room?.readyBySymbol?.A && room?.readyBySymbol?.B);
   const roundHistory = room?.roundHistory ?? [];
 
+  const aiActive = Boolean(room && aiActiveRoom === room.roomId);
+  // 棋盘最大边 ≥ 6（含 6*6、6*7、7*8、8*8 等所有组合）时开放接入 AI
+  const aiAvailable = Boolean(room && playerSymbol && (rows >= 6 || cols >= 6));
+
   const voteA = room?.nextRoundVotes?.A ?? false;
   const voteB = room?.nextRoundVotes?.B ?? false;
   const myVote = playerSymbol === 'A' ? voteA : playerSymbol === 'B' ? voteB : false;
@@ -502,6 +524,100 @@ function App() {
     }, 700);
     return () => window.clearTimeout(timer);
   }, [replayAuto, viewingHistory, replayStep, selectedRound]);
+
+  // AI 驱动状态机：接入后自动完成确认规格/提议规格/准备/掷骰/落子与跟随投票。
+  // 未填 API Key 时退化为随机落子（可作为陪练机器人）。
+  useEffect(() => {
+    if (!aiActive || !room || !playerSymbol) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      if (aiBusyRef.current) {
+        return;
+      }
+
+      aiBusyRef.current = true;
+      void (async () => {
+        try {
+          const me = playerSymbol;
+          const other: PlayerSymbol = me === 'A' ? 'B' : 'A';
+
+          if (room.status === 'waiting') {
+            if (!room.specAgreed) {
+              if (room.specAgreedOnce) {
+                await aiEmit('confirm_spec', { roomId: room.roomId });
+              } else if (!room.boardProposal) {
+                await aiEmit('propose_board', {
+                  roomId: room.roomId,
+                  rows: room.boardRows,
+                  cols: room.boardCols,
+                });
+              }
+              return;
+            }
+
+            if (!room.readyBySymbol[me]) {
+              await aiEmit('player_ready', { roomId: room.roomId, ready: true });
+              return;
+            }
+            return;
+          }
+
+          if (room.status === 'rolling' && room.diceRolls?.[me] === null) {
+            await aiEmit('roll_dice', { roomId: room.roomId });
+            return;
+          }
+
+          if (room.status === 'playing' && room.currentTurn === me) {
+            const valid = allEdges(room.boardRows, room.boardCols).filter(
+              (e) => !room.claimedEdges[e],
+            );
+            if (valid.length === 0) {
+              return;
+            }
+
+            setAiThinking(true);
+            let edge: string | null = null;
+            if (aiConfig.apiKey) {
+              try {
+                const image = aiConfig.useVision ? drawBoardImage(room) : null;
+                const reply = await requestAiMove(
+                  aiConfig,
+                  buildPrompt(room, me, valid),
+                  image,
+                );
+                edge = parseEdgeReply(reply, valid);
+              } catch {
+                aiErrorsRef.current += 1;
+                setAiErrors(aiErrorsRef.current);
+                if (aiErrorsRef.current >= 3) {
+                  setAiActiveRoom(null);
+                  pushSystemMessage('AI 连续出错，已自动断开。');
+                }
+              }
+            }
+            setAiThinking(false);
+            if (!edge) {
+              edge = valid[Math.floor(Math.random() * valid.length)];
+            }
+            await aiEmit('make_move', { roomId: room.roomId, edgeId: edge });
+            return;
+          }
+
+          if ((room.status === 'finished' || room.status === 'playing') && room.nextRoundVotes) {
+            if (room.nextRoundVotes[other] && !room.nextRoundVotes[me]) {
+              await aiEmit('vote_next_round', { roomId: room.roomId });
+            }
+          }
+        } finally {
+          aiBusyRef.current = false;
+        }
+      })();
+    }, aiConfig.intervalMs);
+
+    return () => window.clearTimeout(timer);
+  }, [aiActive, room, playerSymbol, aiConfig, pushSystemMessage]);
 
   useEffect(() => {
     const socket = socketRef.current;
@@ -889,6 +1005,57 @@ function App() {
     });
   }
 
+  function openAiModal(): void {
+    setAiDraft(loadAiConfig());
+    setAiModal(true);
+  }
+
+  function deactivateAi(): void {
+    setAiActiveRoom(null);
+    setAiThinking(false);
+    aiErrorsRef.current = 0;
+    setAiErrors(0);
+    pushSystemMessage('已断开 AI。');
+  }
+
+  function saveAndActivateAi(): void {
+    if (!room) {
+      return;
+    }
+
+    const config: AiConfig = {
+      baseUrl: aiDraft.baseUrl.trim() || 'https://api.openai.com/v1',
+      apiKey: aiDraft.apiKey.trim(),
+      model: aiDraft.model.trim() || 'gpt-4o-mini',
+      intervalMs: Math.max(300, Math.floor(aiDraft.intervalMs) || 1000),
+      useVision: aiDraft.useVision,
+    };
+
+    if (!config.apiKey) {
+      pushSystemMessage('未填写 API Key：AI 将随机落子，可作为陪练机器人。');
+    }
+
+    setAiConfig(config);
+    saveAiConfig(config);
+    setAiModal(false);
+    setAiActiveRoom(room.roomId);
+    aiErrorsRef.current = 0;
+    setAiErrors(0);
+    pushSystemMessage(
+      config.apiKey ? 'AI 已接入，将代你完成确认规格、准备、掷骰与落子。' : 'AI 陪练已接入（随机落子模式）。',
+    );
+    socketRef.current?.emit('send_chat', {
+      roomId: room.roomId,
+      message: config.apiKey ? '🤖 我已接入 AI 代打' : '🤖 我已接入 AI 陪练（随机落子）',
+    });
+  }
+
+  function aiEmit(event: string, payload: Record<string, unknown>): Promise<{ ok?: boolean }> {
+    return new Promise((resolve) => {
+      socketRef.current?.emit(event, payload, (res: unknown) => resolve((res ?? {}) as { ok?: boolean }));
+    });
+  }
+
   function renderChatBody(item: ChatMessage) {
     if (item.kind === 'board-proposal' && item.proposal) {
       const proposal = item.proposal;
@@ -1028,6 +1195,7 @@ function App() {
     setRollingDice(false);
     setStarterModal({ show: false, text: '' });
     setSelectedHistoryRound(null);
+    setAiActiveRoom(null);
     syncRoomUrl(null);
   }
 
@@ -1176,6 +1344,23 @@ function App() {
               <button type="button" onClick={resetLocal} className="secondary block-btn">
                 退回首页
               </button>
+              {aiAvailable && (
+                <>
+                  <button
+                    type="button"
+                    className="block-btn"
+                    onClick={() => (aiActive ? deactivateAi() : openAiModal())}
+                  >
+                    {aiActive ? '断开 AI' : '接入 AI'}
+                  </button>
+                  {aiActive && (
+                    <p className="hint ai-status">
+                      🤖 AI {aiThinking ? '思考中…' : '待机'}
+                      {aiErrors > 0 ? ` · 出错 ${aiErrors} 次` : ''}
+                    </p>
+                  )}
+                </>
+              )}
             </div>
             <div className="system-messages">
               {systemMessages.map((m) => (
@@ -1264,7 +1449,10 @@ function App() {
                     </span>
                   )}
                 </div>
-                <div className="score-name">{playerA?.name || '等待加入'}</div>
+                <div className="score-name">
+                  {playerA?.name || '等待加入'}
+                  {aiActive && playerSymbol === 'A' ? ' 🤖' : ''}
+                </div>
                 <div className="score-bottom">
                   {aActive && <span className="playing-tag">行动中</span>}
                   <strong>{displayScores.A}</strong>
@@ -1290,7 +1478,10 @@ function App() {
                     </span>
                   )}
                 </div>
-                <div className="score-name">{playerB?.name || '等待加入'}</div>
+                <div className="score-name">
+                  {playerB?.name || '等待加入'}
+                  {aiActive && playerSymbol === 'B' ? ' 🤖' : ''}
+                </div>
                 <div className="score-bottom">
                   {bActive && <span className="playing-tag">行动中</span>}
                   <strong>{displayScores.B}</strong>
@@ -1549,6 +1740,68 @@ function App() {
             <button type="button" onClick={() => setRulesOpen(false)}>
               知道了
             </button>
+          </div>
+        </div>
+      )}
+
+      {aiModal && (
+        <div className="modal-backdrop" onClick={() => setAiModal(false)}>
+          <div className="starter-modal ai-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="starter-modal-title">接入 AI 代打</div>
+            <p className="hint ai-risk">
+              🔐 API Key 只保存在你的浏览器本地，并仅直连你填写的 API 地址，不会经过本游戏服务器；请勿在公共设备上勾选保存。
+            </p>
+            <div className="field-row">
+              <label>API 地址</label>
+              <input
+                value={aiDraft.baseUrl}
+                onChange={(e) => setAiDraft({ ...aiDraft, baseUrl: e.target.value })}
+                placeholder="https://api.openai.com/v1"
+              />
+            </div>
+            <div className="field-row">
+              <label>API Key</label>
+              <input
+                type="password"
+                value={aiDraft.apiKey}
+                onChange={(e) => setAiDraft({ ...aiDraft, apiKey: e.target.value })}
+                placeholder="sk-..."
+              />
+            </div>
+            <div className="field-row">
+              <label>模型</label>
+              <input
+                value={aiDraft.model}
+                onChange={(e) => setAiDraft({ ...aiDraft, model: e.target.value })}
+                placeholder="gpt-4o-mini"
+              />
+            </div>
+            <div className="field-row">
+              <label>间隔(ms)</label>
+              <input
+                type="number"
+                min={300}
+                step={100}
+                value={aiDraft.intervalMs}
+                onChange={(e) => setAiDraft({ ...aiDraft, intervalMs: Number(e.target.value) })}
+              />
+            </div>
+            <div className="hint ai-vision">
+              <input
+                type="checkbox"
+                checked={aiDraft.useVision}
+                onChange={(e) => setAiDraft({ ...aiDraft, useVision: e.target.checked })}
+              />{' '}
+              发送棋盘截图（需视觉模型，消耗更多 token）
+            </div>
+            <div className="ai-modal-actions">
+              <button type="button" className="secondary" onClick={() => setAiModal(false)}>
+                取消
+              </button>
+              <button type="button" onClick={saveAndActivateAi}>
+                {aiDraft.apiKey.trim() ? '保存并接入' : '接入（随机陪练）'}
+              </button>
+            </div>
           </div>
         </div>
       )}

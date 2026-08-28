@@ -1344,3 +1344,30 @@ button.secondary {
     transform: translateY(0) scale(1);
   }
 }
+
+/* ==================== AI 接入 ==================== */
+.ai-status {
+  font-weight: 600;
+}
+
+.ai-modal .field-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.ai-vision {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ai-risk {
+  margin: 0 0 4px;
+}
+
+.ai-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
