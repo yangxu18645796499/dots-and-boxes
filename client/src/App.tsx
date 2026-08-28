@@ -267,6 +267,7 @@ function App() {
   const [aiActiveRoom, setAiActiveRoom] = useState<string | null>(null);
   const [aiThinking, setAiThinking] = useState(false);
   const [aiErrors, setAiErrors] = useState(0);
+  const [showKey, setShowKey] = useState(false);
 
   const room = useGameStore((s) => s.room);
   const playerSymbol = useGameStore((s) => s.playerSymbol);
@@ -1031,6 +1032,12 @@ function App() {
       useVision: aiDraft.useVision,
     };
 
+    // 密钥安全：只允许 HTTPS（本地调试可用 localhost），防止 Key 明文跨网络
+    if (!/^https:\/\//i.test(config.baseUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(config.baseUrl)) {
+      pushSystemMessage('为保护密钥安全，API 地址必须使用 HTTPS（本地调试可用 http://localhost）。');
+      return;
+    }
+
     if (!config.apiKey) {
       pushSystemMessage('未填写 API Key：AI 将随机落子，可作为陪练机器人。');
     }
@@ -1038,6 +1045,7 @@ function App() {
     setAiConfig(config);
     saveAiConfig(config);
     setAiModal(false);
+    setShowKey(false);
     setAiActiveRoom(room.roomId);
     aiErrorsRef.current = 0;
     setAiErrors(0);
@@ -1747,28 +1755,36 @@ function App() {
       {aiModal && (
         <div className="modal-backdrop" onClick={() => setAiModal(false)}>
           <div className="starter-modal ai-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="starter-modal-title">接入 AI 代打</div>
-            <p className="hint ai-risk">
-              🔐 API Key 只保存在你的浏览器本地，并仅直连你填写的 API 地址，不会经过本游戏服务器；请勿在公共设备上勾选保存。
+            <div className="ai-modal-head">
+              <div className="starter-modal-title">接入 AI 代打</div>
+              <span className="ai-lock" title="密钥仅存本地">🔒</span>
+            </div>
+            <p className="ai-note">
+              🔐 API Key 只保存在你的浏览器本地（localStorage），仅直连你填写的 API 地址，永远不会经过本游戏服务器。
             </p>
-            <div className="field-row">
-              <label>API 地址</label>
+            <div className="ai-field">
+              <label>API 地址（OpenAI 兼容）</label>
               <input
                 value={aiDraft.baseUrl}
                 onChange={(e) => setAiDraft({ ...aiDraft, baseUrl: e.target.value })}
                 placeholder="https://api.openai.com/v1"
               />
             </div>
-            <div className="field-row">
+            <div className="ai-field">
               <label>API Key</label>
-              <input
-                type="password"
-                value={aiDraft.apiKey}
-                onChange={(e) => setAiDraft({ ...aiDraft, apiKey: e.target.value })}
-                placeholder="sk-..."
-              />
+              <div className="ai-key-row">
+                <input
+                  type={showKey ? 'text' : 'password'}
+                  value={aiDraft.apiKey}
+                  onChange={(e) => setAiDraft({ ...aiDraft, apiKey: e.target.value })}
+                  placeholder="sk-..."
+                />
+                <button type="button" className="ai-eye" onClick={() => setShowKey(!showKey)}>
+                  {showKey ? '隐藏' : '显示'}
+                </button>
+              </div>
             </div>
-            <div className="field-row">
+            <div className="ai-field">
               <label>模型</label>
               <input
                 value={aiDraft.model}
@@ -1776,23 +1792,25 @@ function App() {
                 placeholder="gpt-4o-mini"
               />
             </div>
-            <div className="field-row">
-              <label>间隔(ms)</label>
-              <input
-                type="number"
-                min={300}
-                step={100}
-                value={aiDraft.intervalMs}
-                onChange={(e) => setAiDraft({ ...aiDraft, intervalMs: Number(e.target.value) })}
-              />
-            </div>
-            <div className="hint ai-vision">
-              <input
-                type="checkbox"
-                checked={aiDraft.useVision}
-                onChange={(e) => setAiDraft({ ...aiDraft, useVision: e.target.checked })}
-              />{' '}
-              发送棋盘截图（需视觉模型，消耗更多 token）
+            <div className="ai-field-row2">
+              <div className="ai-field">
+                <label>行动间隔(ms)</label>
+                <input
+                  type="number"
+                  min={300}
+                  step={100}
+                  value={aiDraft.intervalMs}
+                  onChange={(e) => setAiDraft({ ...aiDraft, intervalMs: Number(e.target.value) })}
+                />
+              </div>
+              <label className="ai-vision">
+                <input
+                  type="checkbox"
+                  checked={aiDraft.useVision}
+                  onChange={(e) => setAiDraft({ ...aiDraft, useVision: e.target.checked })}
+                />
+                发送棋盘截图（需视觉模型）
+              </label>
             </div>
             <div className="ai-modal-actions">
               <button type="button" className="secondary" onClick={() => setAiModal(false)}>

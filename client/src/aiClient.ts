@@ -2,7 +2,7 @@
 // API Key 仅保存在当前浏览器的 localStorage，只直连用户填写的 API 地址，
 // 永远不会经过本游戏的服务器。
 import type { PlayerSymbol, RoomState } from './App';
-import { GAME_RULES } from './gameRules';
+import { AI_STRATEGY, GAME_RULES } from './gameRules';
 
 export type AiConfig = {
   baseUrl: string;
@@ -50,9 +50,71 @@ export function allEdges(rows: number, cols: number): string[] {
   return edges;
 }
 
-// 规则 + 当前局面 → 提示词。规则部分与"查看规则"弹窗同源（GAME_RULES）。
+// 一个盒子的四条边
+function boxEdges(r: number, c: number): string[] {
+  return [`h-${r}-${c}`, `h-${r + 1}-${c}`, `v-${r}-${c}`, `v-${r}-${c + 1}`];
+}
+
+export type BoardAnalysis = {
+  // 立即得盒的边：落子即补全某个三边盒
+  captureEdges: string[];
+  // 安全边：落子后不会产生任何三边盒（对手无法立即得盒）
+  safeEdges: string[];
+  // 危险边：落子后对手将立即得盒
+  riskyEdges: string[];
+};
+
+export function analyzeBoard(room: RoomState, candidates: string[]): BoardAnalysis {
+  const claimed = new Set(Object.keys(room.claimedEdges));
+  const captureEdges = new Set<string>();
+
+  for (let r = 0; r < room.boardRows; r += 1) {
+    for (let c = 0; c < room.boardCols; c += 1) {
+      const edges = boxEdges(r, c);
+      const missing = edges.filter((e) => !claimed.has(e));
+      if (missing.length === 1) {
+        captureEdges.add(missing[0]);
+      }
+    }
+  }
+
+  const safeEdges: string[] = [];
+  const riskyEdges: string[] = [];
+  for (const edge of candidates) {
+    if (captureEdges.has(edge)) {
+      continue;
+    }
+
+    const [o, rs, cs] = edge.split('-');
+    const rr = Number(rs);
+    const cc = Number(cs);
+    const neighbours: Array<[number, number]> =
+      o === 'h'
+        ? [...(rr > 0 ? [[rr - 1, cc] as [number, number]] : []), ...(rr < room.boardRows ? [[rr, cc] as [number, number]] : [])]
+        : [...(cc > 0 ? [[rr, cc - 1] as [number, number]] : []), ...(cc < room.boardCols ? [[rr, cc] as [number, number]] : [])];
+
+    const givesCapture = neighbours.some(([br, bc]) => {
+      const edges = boxEdges(br, bc);
+      const present = edges.filter((e) => e === edge || claimed.has(e)).length;
+      return present === 3;
+    });
+
+    if (givesCapture) {
+      riskyEdges.push(edge);
+    } else {
+      safeEdges.push(edge);
+    }
+  }
+
+  return { captureEdges: [...captureEdges].filter((e) => candidates.includes(e)), safeEdges, riskyEdges };
+}
+
+// 规则（与规则弹窗同源）+ Berlekamp 高阶策略 + 已计算的战术事实 → 提示词
 export function buildPrompt(room: RoomState, me: PlayerSymbol, valid: string[]): string {
   const rulesText = GAME_RULES.map(
+    (section) => `【${section.title}】\n${section.items.map((item) => `- ${item}`).join('\n')}`,
+  ).join('\n');
+  const strategyText = AI_STRATEGY.map(
     (section) => `【${section.title}】\n${section.items.map((item) => `- ${item}`).join('\n')}`,
   ).join('\n');
   const claimed = Object.entries(room.claimedEdges)
@@ -64,23 +126,41 @@ export function buildPrompt(room: RoomState, me: PlayerSymbol, valid: string[]):
     .join(', ');
   const boxesText = boxes || '无';
 
+  const analysis = analyzeBoard(room, valid);
+  const list = (arr: string[], empty: string) => (arr.length ? arr.join(', ') : empty);
+  const captureText = analysis.captureEdges.length
+    ? analysis.captureEdges.join(', ')
+    : '无';
+
   return [
-    `你在玩点格棋（Dots and Boxes），棋盘 ${room.boardRows}x${room.boardCols}，你是 ${me} 方。请只依据以下信息行动。`,
+    `你是点格棋（Dots and Boxes）顶尖高手，棋盘 ${room.boardRows}x${room.boardCols}，你执 ${me} 方。请依据以下规则、策略与精确的战术分析选出最佳一步。`,
     '',
     '== 游戏规则 ==',
     rulesText,
     '',
+    '== 高阶策略（Berlekamp《The Dots-and-Boxes Game》）==',
+    strategyText,
+    '',
     '== 当前局面 ==',
-    `回合：第 ${room.roundNumber} 局，状态：${room.status}`,
-    `我方已得盒子：${room.scores[me]}；对方已得盒子：${room.scores[me === 'A' ? 'B' : 'A']}`,
+    `第 ${room.roundNumber} 局，状态：${room.status}，轮到 ${room.currentTurn} 方（你）。`,
+    `比分：A ${room.scores.A} : B ${room.scores.B}（你是 ${me} 方，你的得盒数为 ${room.scores[me]}）。`,
     `已占边：${claimedText}`,
     `已归属盒子：${boxesText}`,
-    `当前轮到：${room.currentTurn} 方（就是你）`,
-    `你可选择的边：${valid.join(', ')}`,
     '',
-    '== 行动要求 ==',
-    '优先补全能得盒的边；避免送给对方三边盒（即让对方一步成盒）。',
-    '只输出一个 JSON 对象：{"edge":"<从你可选择的边中选一条>"}，不要输出任何其他内容。',
+    '== 战术分析（系统已为你精确计算）==',
+    `可落的边（全部）：${valid.join(', ')}`,
+    `立即得盒的边（落子即得 1 分并可继续行动）：${captureText}`,
+    `安全边（落子后不会产生任何三边盒，对手无法立即得盒）：${list(analysis.safeEdges, '无')}`,
+    `危险边（落子后对手立即得盒，仅在被迫开链时按牺牲原则选择）：${list(analysis.riskyEdges, '无')}`,
+    '',
+    '== 决策流程（严格按序）==',
+    '1. 若"立即得盒的边"非空 → 选它。',
+    '2. 否则若存在安全边 → 在安全边中选择：优先保留长链结构、避免制造半开短链、服务长链奇偶目标。',
+    '3. 若只有危险边（被迫开链）→ 按让链/牺牲原则挑选：优先送出"2 盒短链"（硬心施舍）而非会形成可 double-dealing 的结构，并确保对手吃完后打开的下一条链对你有利。',
+    '4. 输出限制不变。',
+    '',
+    '== 输出要求 ==',
+    '只输出一个 JSON 对象：{"edge":"<从可落的边中选一条>"}，不要输出任何解释或其他内容。',
   ].join('\n');
 }
 
@@ -155,15 +235,15 @@ export function drawBoardImage(room: RoomState): string | null {
     ctx.lineWidth = 9;
     ctx.lineCap = 'round';
     Object.entries(room.claimedEdges).forEach(([edge, owner]) => {
-      const [, orientation, r, c] = edge.split('-');
+      const [orientation, rs, cs] = edge.split('-');
       ctx.strokeStyle = colors[owner];
       ctx.beginPath();
       if (orientation === 'h') {
-        ctx.moveTo(x(Number(c)), y(Number(r)));
-        ctx.lineTo(x(Number(c) + 1), y(Number(r)));
+        ctx.moveTo(x(Number(cs)), y(Number(rs)));
+        ctx.lineTo(x(Number(cs) + 1), y(Number(rs)));
       } else {
-        ctx.moveTo(x(Number(c)), y(Number(r)));
-        ctx.lineTo(x(Number(c)), y(Number(r) + 1));
+        ctx.moveTo(x(Number(cs)), y(Number(rs)));
+        ctx.lineTo(x(Number(cs)), y(Number(rs) + 1));
       }
       ctx.stroke();
     });

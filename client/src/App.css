@@ -1350,24 +1350,99 @@ button.secondary {
   font-weight: 600;
 }
 
-.ai-modal .field-row input {
+.ai-modal {
+  width: min(480px, calc(100vw - 32px));
+}
+
+.ai-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.ai-lock {
+  font-size: 1.5rem;
+}
+
+.ai-note {
+  margin: 0 0 14px;
+  font-size: 0.85rem;
+  color: var(--muted);
+  background: var(--surface-soft);
+  border-radius: 8px;
+  padding: 8px 10px;
+  line-height: 1.5;
+}
+
+.ai-field {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.ai-field label {
+  font-weight: 600;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.ai-field input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: var(--input-bg);
+  color: var(--ink);
+  font-size: 0.9rem;
+}
+
+.ai-key-row {
+  display: flex;
+  gap: 6px;
+}
+
+.ai-key-row input {
   flex: 1;
   min-width: 0;
+}
+
+.ai-eye {
+  border: none;
+  background: var(--surface-soft);
+  color: var(--muted);
+  border-radius: 8px;
+  padding: 0 12px;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.ai-field-row2 {
+  display: flex;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 4px;
+}
+
+.ai-field-row2 .ai-field {
+  flex: 1;
+  margin-bottom: 0;
 }
 
 .ai-vision {
   display: flex;
   align-items: center;
   gap: 6px;
-}
-
-.ai-risk {
-  margin: 0 0 4px;
+  font-size: 0.82rem;
+  color: var(--muted);
+  white-space: nowrap;
+  padding-bottom: 8px;
 }
 
 .ai-modal-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  margin-top: 16px;
+  margin-top: 18px;
 }
