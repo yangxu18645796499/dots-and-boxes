@@ -170,7 +170,8 @@ export async function requestAiMove(
   imageDataUrl: string | null,
 ): Promise<string> {
   const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), 10_000);
+  // 思考型模型推理较慢，超时放宽到 60s
+  const timer = window.setTimeout(() => controller.abort(), 60_000);
   try {
     const content: Array<{ type: string; text?: string; image_url?: { url: string } }> = [
       { type: 'text', text: prompt },
@@ -179,18 +180,24 @@ export async function requestAiMove(
       content.push({ type: 'image_url', image_url: { url: imageDataUrl } });
     }
 
+    // Qwen 系思考模型默认深度思考，延迟可达数十秒；落子场景关闭思考
+    const body: Record<string, unknown> = {
+      model: config.model,
+      // 纯文本时发字符串 content，最大化对 DeepSeek/小模型等严格兼容端点的适配
+      messages: [{ role: 'user', content: imageDataUrl ? content : prompt }],
+      temperature: 0.2,
+    };
+    if (/qwen/i.test(config.model)) {
+      body.chat_template_kwargs = { enable_thinking: false };
+    }
+
     const res = await fetch(`${config.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${config.apiKey}`,
       },
-      body: JSON.stringify({
-        model: config.model,
-        // 纯文本时发字符串 content，最大化对 DeepSeek/小模型等严格兼容端点的适配
-        messages: [{ role: 'user', content: imageDataUrl ? content : prompt }],
-        temperature: 0.2,
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
 
@@ -205,10 +212,11 @@ export async function requestAiMove(
   }
 }
 
-// 解析模型回复中的边：优先取 JSON 字段，退化为文本中的第一个匹配
+// 解析模型回复中的边：剥离思考段后，优先取 JSON 字段，退化为文本中的第一个匹配
 export function parseEdgeReply(text: string, valid: string[]): string | null {
-  const jsonMatch = text.match(/"(?:edge|edgeId|edge_id)"\s*:\s*"([hv]-\d+-\d+)"/i);
-  const looseMatch = text.match(/\b([hv]-\d+-\d+)\b/);
+  const cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  const jsonMatch = cleaned.match(/"(?:edge|edgeId|edge_id)"\s*:\s*"([hv]-\d+-\d+)"/i);
+  const looseMatch = cleaned.match(/\b([hv]-\d+-\d+)\b/);
   const edge = jsonMatch?.[1] ?? looseMatch?.[1] ?? null;
   return edge && valid.includes(edge) ? edge : null;
 }
