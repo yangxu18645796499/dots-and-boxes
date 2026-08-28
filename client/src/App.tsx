@@ -546,6 +546,15 @@ function App() {
 
           if (room.status === 'waiting') {
             if (!room.specAgreed) {
+              // 对方提议的规格：AI 自动同意，保证双 AI / AI 对真人都能开局
+              if (room.boardProposal && room.boardProposal.by !== me) {
+                await aiEmit('respond_board', {
+                  roomId: room.roomId,
+                  proposalId: room.boardProposal.id,
+                  accept: true,
+                });
+                return;
+              }
               if (room.specAgreedOnce) {
                 await aiEmit('confirm_spec', { roomId: room.roomId });
               } else if (!room.boardProposal) {
@@ -606,8 +615,9 @@ function App() {
             return;
           }
 
-          if ((room.status === 'finished' || room.status === 'playing') && room.nextRoundVotes) {
-            if (room.nextRoundVotes[other] && !room.nextRoundVotes[me]) {
+          if (room.status === 'finished' && room.nextRoundVotes) {
+            // 无人发起时主动发起，对方已发起则跟随——保证 AI 对局能连续进行
+            if (!room.nextRoundVotes[me]) {
               await aiEmit('vote_next_round', { roomId: room.roomId });
             }
           }
