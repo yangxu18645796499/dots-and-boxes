@@ -599,12 +599,9 @@ function App() {
                 );
                 edge = parseEdgeReply(reply, valid);
               } catch {
+                // 出错不断开：随机兜底继续走，状态行仅计数展示（斗蛐蛐模式）
                 aiErrorsRef.current += 1;
                 setAiErrors(aiErrorsRef.current);
-                if (aiErrorsRef.current >= 3) {
-                  setAiActiveRoom(null);
-                  pushSystemMessage('AI 连续出错，已自动断开。');
-                }
               }
             }
             setAiThinking(false);
