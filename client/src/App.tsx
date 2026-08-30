@@ -108,7 +108,15 @@ type StoreState = {
   reset: () => void;
 };
 
-const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
+// 游戏服务器地址：
+// - 显式设置 VITE_SERVER_URL 时优先（公网部署等场景）
+// - 本机 localhost/127.0.0.1 访问 → 走回环 localhost:3001（永不被防火墙拦）
+// - 局域网 IP 访问 → 自动跟随页面地址（如 http://10.4.91.32:3001）
+const SERVER_URL =
+  import.meta.env.VITE_SERVER_URL ||
+  (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+    ? `${window.location.protocol}//localhost:3001`
+    : `${window.location.protocol}//${window.location.hostname}:3001`);
 const SESSION_KEY = 'dots_and_boxes_session_v1';
 const MIN_SIZE = 2;
 const MAX_SIZE = 8;
@@ -1384,6 +1392,11 @@ function App() {
               <button type="button" onClick={resetLocal} className="secondary block-btn">
                 退回首页
               </button>
+              {hasActiveRoom && (
+                <button type="button" onClick={resetLocal} className="block-btn" title="离开当前房间并回到创建界面">
+                  新建房间
+                </button>
+              )}
               {aiAvailable && (
                 <>
                   <button
