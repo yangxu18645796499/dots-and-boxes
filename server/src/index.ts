@@ -197,12 +197,13 @@ app.post('/ai/relay', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(65_000),
+      signal: AbortSignal.timeout(120_000),
     });
     const text = await upstream.text();
     res.status(upstream.status).type('application/json').send(text);
-  } catch {
-    res.status(502).json({ error: { message: '上游 API 请求失败' } });
+  } catch (e) {
+    const timedOut = String(e).includes('timeout') || String(e).includes('Timeout');
+    res.status(502).json({ error: { message: timedOut ? '上游 API 超时（120s），请稍后重试或换更快的模型' : '上游 API 请求失败' } });
   }
 });
 

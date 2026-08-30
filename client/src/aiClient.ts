@@ -170,7 +170,6 @@ export async function requestAiMove(
   imageDataUrl: string | null,
   serverUrl: string,
 ): Promise<string> {
-  const controller = new AbortController();
   // 按模型分级超时：Qwen 走中转时已关闭思考（60s）；reasoner/r1 等思考型模型给足推理时间（150s）
   const isThinkingModel = /reasoner|r1|thinking|deepseek/i.test(config.model);
   const timeoutMs = /qwen/i.test(config.model)
@@ -178,54 +177,68 @@ export async function requestAiMove(
     : isThinkingModel
       ? 150_000
       : 90_000;
-  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const content: Array<{ type: string; text?: string; image_url?: { url: string } }> = [
-      { type: 'text', text: prompt },
-    ];
-    if (imageDataUrl) {
-      content.push({ type: 'image_url', image_url: { url: imageDataUrl } });
-    }
-
-    // Qwen 系思考模型默认深度思考，延迟可达数十秒；落子场景关闭思考
-    const upstreamBody: Record<string, unknown> = {
-      model: config.model,
-      // 纯文本时发字符串 content，最大化对 DeepSeek/小模型等严格兼容端点的适配
-      messages: [{ role: 'user', content: imageDataUrl ? content : prompt }],
-      temperature: 0.2,
-    };
-    if (/qwen/i.test(config.model)) {
-      upstreamBody.chat_template_kwargs = { enable_thinking: false };
-    }
-
-    // 经游戏服务器中转：绕开浏览器扩展/网络环境对跨域 LLM 请求的拦截（服务器哑转发，不存储 Key）
-    const res = await fetch(`${serverUrl.replace(/\/+$/, '')}/ai/relay`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        url: `${config.baseUrl.replace(/\/+$/, '')}/chat/completions`,
-        key: config.apiKey,
-        body: upstreamBody,
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      let reason = `HTTP ${res.status}`;
-      try {
-        const err = (await res.json()) as { error?: { message?: string } };
-        reason = err.error?.message ?? reason;
-      } catch {
-        // 保留默认原因
-      }
-      throw new Error(reason);
-    }
-
-    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-    return data.choices?.[0]?.message?.content ?? '';
-  } finally {
-    window.clearTimeout(timer);
+  const content: Array<{ type: string; text?: string; image_url?: { url: string } }> = [
+    { type: 'text', text: prompt },
+  ];
+  if (imageDataUrl) {
+    content.push({ type: 'image_url', image_url: { url: imageDataUrl } });
   }
+
+  // Qwen 系思考模型默认深度思考，延迟可达数十秒；落子场景关闭思考
+  const upstreamBody: Record<string, unknown> = {
+    model: config.model,
+    // 纯文本时发字符串 content，最大化对 DeepSeek/小模型等严格兼容端点的适配
+    messages: [{ role: 'user', content: imageDataUrl ? content : prompt }],
+    temperature: 0.2,
+  };
+  if (/qwen/i.test(config.model)) {
+    upstreamBody.chat_template_kwargs = { enable_thinking: false };
+  }
+
+  // 经游戏服务器中转：绕开浏览器扩展/网络环境对跨域 LLM 请求的拦截（服务器哑转发，不存储 Key）
+  const relayUrl = `${serverUrl.replace(/\/+$/, '')}/ai/relay`;
+  const relayPayload = JSON.stringify({
+    url: `${config.baseUrl.replace(/\/+$/, '')}/chat/completions`,
+    key: config.apiKey,
+    body: upstreamBody,
+  });
+
+  let lastError = new Error('未知错误');
+  // 瞬时故障（上游繁忙/重启/网络抖动）自动重试一次，避免随机兜底打断真实 AI 对局
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const attemptController = new AbortController();
+    const timer = window.setTimeout(() => attemptController.abort(), timeoutMs);
+    try {
+      const res = await fetch(relayUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: relayPayload,
+        signal: attemptController.signal,
+      });
+
+      if (!res.ok) {
+        let reason = `HTTP ${res.status}`;
+        try {
+          const err = (await res.json()) as { error?: { message?: string } };
+          reason = err.error?.message ?? reason;
+        } catch {
+          // 保留默认原因
+        }
+        throw new Error(reason);
+      }
+
+      const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+      return data.choices?.[0]?.message?.content ?? '';
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      if (attempt === 0) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1500));
+      }
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+  throw lastError;
 }
 
 // 解析模型回复中的边：剥离思考段后，优先取 JSON 字段，退化为文本中的第一个匹配
