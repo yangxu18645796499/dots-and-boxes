@@ -274,6 +274,7 @@ function App() {
   const [aiActiveRoom, setAiActiveRoom] = useState<string | null>(null);
   const [aiThinking, setAiThinking] = useState(false);
   const [showKey, setShowKey] = useState(false);
+  const [aiTest, setAiTest] = useState<{ running: boolean; text: string }>({ running: false, text: '' });
 
   const room = useGameStore((s) => s.room);
   const playerSymbol = useGameStore((s) => s.playerSymbol);
@@ -1045,6 +1046,45 @@ function App() {
   function openAiModal(): void {
     setAiDraft(loadAiConfig());
     setAiModal(true);
+    setAiTest({ running: false, text: '' });
+  }
+
+  // 用当前草稿配置发一次最小请求，验证端点/Key/模型是否可用
+  async function testAiConnection(): Promise<void> {
+    setAiTest({ running: true, text: '' });
+    const target = `${aiDraft.baseUrl.trim().replace(/\/+$/, '')}/chat/completions`;
+    try {
+      const res = await fetch(`${SERVER_URL.replace(/\/+$/, '')}/ai/relay`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: target,
+          key: aiDraft.apiKey.trim(),
+          body: {
+            model: aiDraft.model.trim(),
+            messages: [{ role: 'user', content: '只回复：ok' }],
+            max_tokens: 16,
+          },
+        }),
+      });
+      const text = await res.text();
+      if (!res.ok) {
+        let reason = `HTTP ${res.status}`;
+        try {
+          reason = JSON.parse(text).error?.message ?? text.slice(0, 120) ?? reason;
+        } catch {
+          reason = text.slice(0, 120) || reason;
+        }
+        setAiTest({ running: false, text: `✗ ${reason}` });
+        return;
+      }
+
+      const data = JSON.parse(text) as { choices?: Array<{ message?: { content?: string } }> };
+      setAiTest({ running: false, text: '✓ 连接成功，模型已响应' });
+      void data;
+    } catch (e) {
+      setAiTest({ running: false, text: `✗ ${e instanceof Error ? e.message : String(e)}` });
+    }
   }
 
   function deactivateAi(): void {
@@ -1850,6 +1890,21 @@ function App() {
                 />
                 发送棋盘截图（需视觉模型）
               </label>
+            </div>
+            <div className="ai-test-row">
+              <button
+                type="button"
+                className="secondary"
+                onClick={testAiConnection}
+                disabled={aiTest.running || !aiDraft.baseUrl.trim()}
+              >
+                {aiTest.running ? '测试中…' : '测试连接'}
+              </button>
+              {aiTest.text && (
+                <span className={`hint ${aiTest.text.startsWith('✓') ? 'ai-test-ok' : 'ai-test-fail'}`}>
+                  {aiTest.text}
+                </span>
+              )}
             </div>
             <div className="ai-modal-actions">
               <button type="button" className="secondary" onClick={() => setAiModal(false)}>

@@ -1446,3 +1446,21 @@ button.secondary {
   gap: 8px;
   margin-top: 18px;
 }
+
+/* AI 测试连接 */
+.ai-test-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.ai-test-ok {
+  color: #1f9d5a;
+  font-weight: 700;
+}
+
+.ai-test-fail {
+  color: #d05353;
+  font-weight: 700;
+}
