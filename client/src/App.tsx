@@ -249,7 +249,6 @@ function App() {
   const chatListRef = useRef<HTMLDivElement | null>(null);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const aiBusyRef = useRef(false);
-  const aiErrorsRef = useRef(0);
   const [playerName, setPlayerName] = useState(INITIAL_SESSION?.playerName ?? readIdentity()?.name ?? '');
   const [roomIdInput, setRoomIdInput] = useState(() => {
     // 支持 ?room=XXXX / ?ROOM=xxxx 分享链接：URL 参数优先于本地会话
@@ -274,7 +273,6 @@ function App() {
   const [aiModal, setAiModal] = useState(false);
   const [aiActiveRoom, setAiActiveRoom] = useState<string | null>(null);
   const [aiThinking, setAiThinking] = useState(false);
-  const [aiErrors, setAiErrors] = useState(0);
   const [showKey, setShowKey] = useState(false);
 
   const room = useGameStore((s) => s.room);
@@ -607,9 +605,7 @@ function App() {
                 );
                 edge = parseEdgeReply(reply, valid);
               } catch {
-                // 出错不断开：随机兜底继续走，状态行仅计数展示（斗蛐蛐模式）
-                aiErrorsRef.current += 1;
-                setAiErrors(aiErrorsRef.current);
+                // 出错不断开：随机兜底继续走（斗蛐蛐模式）
               }
             }
             setAiThinking(false);
@@ -1054,8 +1050,6 @@ function App() {
   function deactivateAi(): void {
     setAiActiveRoom(null);
     setAiThinking(false);
-    aiErrorsRef.current = 0;
-    setAiErrors(0);
     pushSystemMessage('已断开 AI。');
   }
 
@@ -1087,8 +1081,6 @@ function App() {
     setAiModal(false);
     setShowKey(false);
     setAiActiveRoom(room.roomId);
-    aiErrorsRef.current = 0;
-    setAiErrors(0);
     pushSystemMessage(
       config.apiKey ? 'AI 已接入，将代你完成确认规格、准备、掷骰与落子。' : 'AI 陪练已接入（随机落子模式）。',
     );
@@ -1409,7 +1401,6 @@ function App() {
                   {aiActive && (
                     <p className="hint ai-status">
                       🤖 AI {aiThinking ? '思考中…' : '待机'}
-                      {aiErrors > 0 ? ` · 出错 ${aiErrors} 次` : ''}
                     </p>
                   )}
                 </>
