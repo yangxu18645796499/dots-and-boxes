@@ -164,13 +164,25 @@ export function buildPrompt(room: RoomState, me: PlayerSymbol, valid: string[]):
   ].join('\n');
 }
 
+// 各服务商「关闭思考」的参数形状不同；请求时全部下发（Qwen/vLLM、智谱 GLM、硅基流动、OpenRouter、OpenAI 推理系），
+// 网关不认识的字段会返回 400/422，由 requestAiMove 的重试逻辑剔除参数后重发
+function noThinkingHints(): Record<string, unknown> {
+  return {
+    chat_template_kwargs: { enable_thinking: false },
+    thinking: { type: 'disabled' },
+    enable_thinking: false,
+    reasoning: { enabled: false, exclude: true },
+    reasoning_effort: 'minimal',
+  };
+}
+
 export async function requestAiMove(
   config: AiConfig,
   prompt: string,
   imageDataUrl: string | null,
   serverUrl: string,
 ): Promise<string> {
-  // 按模型分级超时：Qwen 走中转时已关闭思考（60s）；reasoner/r1 等思考型模型给足推理时间（150s）
+  // 按模型分级超时：已注入关闭思考开关的家族走 60s；reasoner/r1 等思考型模型给足推理时间（150s）
   const isThinkingModel = /reasoner|r1|thinking|deepseek/i.test(config.model);
   const timeoutMs = /qwen/i.test(config.model)
     ? 60_000
@@ -184,28 +196,33 @@ export async function requestAiMove(
     content.push({ type: 'image_url', image_url: { url: imageDataUrl } });
   }
 
-  // Qwen 系思考模型默认深度思考，延迟可达数十秒；落子场景关闭思考
+  // 所有接入模型一律禁止思考：各服务商「关闭思考」参数形状不同，全部下发；
+  // 网关不认识的字段返回 400/422 时，由下方重试逻辑剔除参数后重发
   const upstreamBody: Record<string, unknown> = {
     model: config.model,
     // 纯文本时发字符串 content，最大化对 DeepSeek/小模型等严格兼容端点的适配
     messages: [{ role: 'user', content: imageDataUrl ? content : prompt }],
     temperature: 0.2,
   };
-  if (/qwen/i.test(config.model)) {
-    upstreamBody.chat_template_kwargs = { enable_thinking: false };
-  }
 
   // 经游戏服务器中转：绕开浏览器扩展/网络环境对跨域 LLM 请求的拦截（服务器哑转发，不存储 Key）
   const relayUrl = `${serverUrl.replace(/\/+$/, '')}/ai/relay`;
-  const relayPayload = JSON.stringify({
-    url: `${config.baseUrl.replace(/\/+$/, '')}/chat/completions`,
-    key: config.apiKey,
-    body: upstreamBody,
-  });
 
   let lastError = new Error('未知错误');
-  // 瞬时故障（上游繁忙/重启/网络抖动）自动重试一次，避免随机兜底打断真实 AI 对局
+  let lastStatus = 0;
+  // 两次尝试：第一次带全套「禁止思考」参数；若网关对参数报 400/422，第二次剔除后重发
   for (let attempt = 0; attempt < 2; attempt++) {
+    const body: Record<string, unknown> = { ...upstreamBody };
+    // 第二次尝试：若上次是 400/422（网关不认识禁思考参数）则剔除参数重发；网络类失败则保留参数重试
+    if (!(attempt > 0 && (lastStatus === 400 || lastStatus === 422))) {
+      Object.assign(body, noThinkingHints());
+    }
+    const relayPayload = JSON.stringify({
+      url: `${config.baseUrl.replace(/\/+$/, '')}/chat/completions`,
+      key: config.apiKey,
+      body,
+    });
+
     const attemptController = new AbortController();
     const timer = window.setTimeout(() => attemptController.abort(), timeoutMs);
     try {
@@ -217,6 +234,7 @@ export async function requestAiMove(
       });
 
       if (!res.ok) {
+        lastStatus = res.status;
         let reason = `HTTP ${res.status}`;
         try {
           const err = (await res.json()) as { error?: { message?: string } };

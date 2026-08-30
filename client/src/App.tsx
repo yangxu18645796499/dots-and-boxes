@@ -1838,8 +1838,8 @@ function App() {
             <p className="ai-note">
               🔐 API Key 只保存在你的浏览器本地（localStorage），仅直连你填写的 API 地址，永远不会经过本游戏服务器。
               <br />
-              💡 建议优先选对话型（非思考）模型：deepseek-chat、qwen-local 等开箱即用；deepseek-reasoner
-              等思考型模型每步可能耗时 1-2 分钟（Qwen 系已自动关闭思考）。
+              💡 所有接入的模型都会自动尝试关闭思考模式（覆盖 Qwen / GLM / DeepSeek / OpenAI 等主流家族，速度拉满）；
+              deepseek-reasoner 这类纯思考模型请改用对话型模型名（如 deepseek-chat）。
             </p>
             <div className="ai-field">
               <label>API 地址（OpenAI 兼容）</label>
